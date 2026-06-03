@@ -1,13 +1,17 @@
 """AAC scalefactor band tables for supported sample rates.
 
 Band boundaries define groups of MDCT coefficients that share a single
-scalefactor. Values are cumulative sample indices into the 1024-coefficient
-MDCT output (AAC-LC long window).
+scalefactor. Values are cumulative sample indices.
 
-Source: ISO/IEC 14496-3 Table 4.110 (long window, 1024 lines).
+Long window: 1024 MDCT lines.
+Short window: 128 MDCT lines per window group (8 groups per frame).
+
+Source: ISO/IEC 14496-3 Table 4.110.
 """
 
 from __future__ import annotations
+
+# ---- Long window (1024 lines) ----
 
 SFB_44100_LONG: list[int] = [
     0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88,
@@ -48,3 +52,37 @@ def get_sfb_offsets(sample_rate: int) -> list[int]:
 
 def get_num_sfb(sample_rate: int) -> int:
     return len(get_sfb_offsets(sample_rate)) - 1
+
+
+# ---- Short window (128 lines per group) ----
+
+SFB_44100_SHORT: list[int] = [
+    0, 4, 8, 12, 16, 20, 28, 36, 44, 56, 68, 80, 96, 112, 128,
+]
+
+SFB_48000_SHORT: list[int] = [
+    0, 4, 8, 12, 16, 20, 28, 36, 44, 56, 68, 80, 96, 112, 128,
+]
+
+SFB_32000_SHORT: list[int] = [
+    0, 4, 8, 12, 16, 20, 28, 36, 44, 56, 68, 80, 96, 112, 128,
+]
+
+SFB_SHORT_TABLES: dict[int, list[int]] = {
+    32000: SFB_32000_SHORT,
+    44100: SFB_44100_SHORT,
+    48000: SFB_48000_SHORT,
+}
+
+
+def get_sfb_offsets_short(sample_rate: int) -> list[int]:
+    if sample_rate not in SFB_SHORT_TABLES:
+        raise ValueError(
+            f"Unsupported sample rate {sample_rate}. "
+            f"Supported: {sorted(SFB_SHORT_TABLES.keys())}"
+        )
+    return SFB_SHORT_TABLES[sample_rate]
+
+
+def get_num_sfb_short(sample_rate: int) -> int:
+    return len(get_sfb_offsets_short(sample_rate)) - 1
