@@ -1,0 +1,10 @@
+sample_rate: 44100
+frame_size: 2048
+hop_size: 1024
+window_type: kbd
+target_bitrate_kbps: 128.0
+
+benchmark:
+  n_warmup: 1
+  n_runs: 10
+  signals: all  # "all" or list of signal names

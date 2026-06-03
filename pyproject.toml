@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "metal-aac"
+version = "0.2.0"
+description = "GPU-accelerated AAC encoder/decoder for Apple Silicon using Metal compute shaders"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "mlx>=0.20",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-benchmark>=4.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/metal_aac"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
