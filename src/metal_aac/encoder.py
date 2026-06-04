@@ -46,6 +46,7 @@ from metal_aac.core.mdct import (
     frame_signal_mlx,
     mdct_cpu,
     mdct_gpu,
+    mdct_short_gpu,
 )
 from metal_aac.core.psychoacoustic import (
     PsychoacousticTables,
@@ -219,7 +220,6 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
     timings["transient_detect"] = t.elapsed
 
     # ---- Parallel path 2: Framing + MDCT ----
-    # Apply window and MDCT (currently all long windows)
     with Timer() as t:
         window_mx = mx.array(window)
         frames_mx = frame_signal_mlx(
@@ -230,10 +230,38 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
 
     num_frames = frames_mx.shape[0]
 
+    # MDCT: long windows for most frames, short (8x256) for transient frames
     with Timer() as t:
-        basis_gpu = MDCTBasisGPU(config.frame_size)
-        mdct_mx = mdct_gpu(frames_mx, basis_gpu)
-        mx.eval(mdct_mx)
+        has_short = config.enable_window_switching and np.any(window_seqs == 2)
+        if has_short:
+            long_mask = (window_seqs != 2)
+            short_mask = (window_seqs == 2)
+            basis_long = MDCTBasisGPU(config.frame_size)
+            basis_short = MDCTBasisGPU(256)
+
+            mdct_np = np.zeros((num_frames, config.n_coeffs), dtype=np.float32)
+
+            if np.any(long_mask):
+                long_idx = np.where(long_mask)[0]
+                long_frames = mx.array(np.array(frames_mx)[long_idx])
+                long_mdct = np.array(mdct_gpu(long_frames, basis_long))
+                mx.eval(mdct_gpu(long_frames, basis_long))
+                mdct_np[long_idx] = long_mdct
+
+            if np.any(short_mask):
+                short_idx = np.where(short_mask)[0]
+                short_frames = mx.array(np.array(frames_mx)[short_idx])
+                short_mdct = mdct_short_gpu(short_frames, basis_short)
+                mx.eval(short_mdct)
+                # Flatten 8x128 -> 1024 so quantizer sees uniform shape
+                mdct_np[short_idx] = np.array(short_mdct).reshape(-1, config.n_coeffs)
+
+            mdct_mx = mx.array(mdct_np)
+            mx.eval(mdct_mx)
+        else:
+            basis_gpu = MDCTBasisGPU(config.frame_size)
+            mdct_mx = mdct_gpu(frames_mx, basis_gpu)
+            mx.eval(mdct_mx)
     timings["mdct"] = t.elapsed
 
     # ---- Psychoacoustic masking (from windowed frames, post-MDCT) ----
