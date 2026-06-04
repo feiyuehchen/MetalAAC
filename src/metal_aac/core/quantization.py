@@ -361,7 +361,12 @@ def quantize_batch_gpu(
         gain_hi = mx.where(~fits, gains - 1, gain_hi)
         mx.eval(gain_lo, gain_hi, best_gains, best_bits)
 
-    # Step 3: final quantization with best gains
+    # Scalefactors are kept as-is from the initial SMR-based computation.
+    # The ISO SF mapping (iso_sf = 157 - (gg - sf*4)/3) in raw_data_block.py
+    # converts to ISO convention at bitstream writing time.
+
+    # Step 4: final quantization with optimized gains + SFs
+    per_coeff_sf = scalefactors[:, sfb_map_mx]
     final_gf = mx.power(
         2.0,
         (best_gains[:, None].astype(mx.float32) - per_coeff_sf * 4) / 16.0,

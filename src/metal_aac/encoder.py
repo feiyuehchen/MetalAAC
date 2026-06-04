@@ -274,32 +274,19 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
         mx.eval(masking_mx)
     timings["psychoacoustic"] = t.elapsed
 
-    # ---- Quantization: Metal or MLX fallback ----
-    try:
-        from metal_aac.core.metal_bridge import MetalHuffman
-
-        metal = MetalHuffman.shared()
-
-        with Timer() as t:
-            mdct_np = np.array(mdct_mx)
-            masking_np = np.array(masking_mx)
-            q, sf, gg, tb = metal.quantize(
-                mdct_np, masking_np,
-                config.target_bits_per_frame,
-                config.sample_rate,
-            )
-        timings["quantization"] = t.elapsed
-    except (OSError, RuntimeError, FileNotFoundError):
-        with Timer() as t:
-            quant_result = quantize_batch_gpu(
-                mdct_mx, masking_mx,
-                config.target_bits_per_frame,
-                config.sample_rate,
-            )
-        timings["quantization"] = t.elapsed
-        q = quant_result.quantized
-        sf = quant_result.scalefactors
-        gg = quant_result.global_gain
+    # ---- Quantization: MLX two-loop (with outer SF iteration) ----
+    # Always use MLX quantizer for quality (includes outer SF loop).
+    # Metal quantizer is faster but has no outer loop — used only for legacy path.
+    with Timer() as t:
+        quant_result = quantize_batch_gpu(
+            mdct_mx, masking_mx,
+            config.target_bits_per_frame,
+            config.sample_rate,
+        )
+    timings["quantization"] = t.elapsed
+    q = quant_result.quantized
+    sf = quant_result.scalefactors
+    gg = quant_result.global_gain
 
     # ---- Huffman + bitstream assembly ----
     with Timer() as t:
