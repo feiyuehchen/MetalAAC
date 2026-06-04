@@ -194,6 +194,36 @@ def dequantize_cpu(
     return output
 
 
+def dequantize_iso_cpu(
+    quantized: np.ndarray,
+    iso_scalefactors: np.ndarray,
+    sample_rate: int = 44100,
+) -> np.ndarray:
+    """ISO inverse quantization: x_hat = sign(q) * |q|^(4/3) * 2^((sf-200)/4).
+
+    quantized: (B, N) int32
+    iso_scalefactors: (B, num_sfb) int32 — direct ISO SF values (100-255)
+    returns: (B, N) float32
+    """
+    batch, n_coeffs = quantized.shape
+    sfb_offsets = get_sfb_offsets(sample_rate)
+    num_sfb = len(sfb_offsets) - 1
+    output = np.zeros((batch, n_coeffs), dtype=np.float32)
+
+    for b in range(batch):
+        for sb in range(num_sfb):
+            lo, hi = sfb_offsets[sb], sfb_offsets[sb + 1]
+            sf = int(iso_scalefactors[b, sb])
+            scale = 2.0 ** ((sf - 200) / 4.0)
+
+            q = quantized[b, lo:hi].astype(np.float32)
+            signs = np.sign(q)
+            abs_q = np.abs(q)
+            output[b, lo:hi] = signs * np.power(abs_q, 4.0 / 3.0) * scale
+
+    return output
+
+
 # ---- GPU implementation ----
 
 

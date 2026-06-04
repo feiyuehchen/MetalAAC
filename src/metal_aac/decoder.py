@@ -24,6 +24,7 @@ except ImportError:
 from metal_aac.core.adts import ADTSReader
 from metal_aac.core.bitstream import INDEX_TO_SAMPLE_RATE, BitstreamReader
 from metal_aac.core.huffman import decode_frames_metal, decode_spectral_data
+from metal_aac.core.raw_data_block import decode_raw_data_block_iso
 from metal_aac.core.mdct import (
     MDCTBasis,
     MDCTBasisGPU,
@@ -34,6 +35,7 @@ from metal_aac.core.mdct import (
 from metal_aac.core.quantization import (
     dequantize_cpu,
     dequantize_gpu,
+    dequantize_iso_cpu,
     precompute_sf_gains,
 )
 from metal_aac.metrics.throughput import Timer
@@ -74,36 +76,36 @@ def _is_adts(data: bytes) -> bool:
     return len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xF0) == 0xF0
 
 
-def _parse_frames(bitstream: bytes) -> tuple[list[tuple], int, int]:
+def _parse_frames(bitstream: bytes) -> tuple[list[tuple], int, int, bool]:
     """Parse bitstream (auto-detect ADTS vs legacy).
 
-    Returns: (frame_list, sample_rate, num_sfb)
+    Returns: (frame_list, sample_rate, num_sfb, is_adts)
     Each frame is (payload_bytes,).
     """
     if _is_adts(bitstream):
         reader = ADTSReader(bitstream)
         raw_frames = reader.read_all_frames()
         if not raw_frames:
-            return [], 44100, 49
+            return [], 44100, 49, True
         sr = raw_frames[0][0]["sample_rate"]
         from metal_aac.tables.scalefactor_bands import get_num_sfb
         num_sfb = get_num_sfb(sr)
-        return [(payload,) for _, payload in raw_frames], sr, num_sfb
+        return [(payload,) for _, payload in raw_frames], sr, num_sfb, True
     else:
         reader = BitstreamReader(bitstream)
         raw_frames = reader.read_all_frames()
         if not raw_frames:
-            return [], 44100, 49
+            return [], 44100, 49, False
         header = raw_frames[0][0]
         sr = INDEX_TO_SAMPLE_RATE.get(header.sample_rate_index, 44100)
-        return [(payload,) for _, payload in raw_frames], sr, header.num_sfb
+        return [(payload,) for _, payload in raw_frames], sr, header.num_sfb, False
 
 
 def _decode_cpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
     timings = {}
 
     with Timer() as t:
-        parsed_frames, sample_rate, num_sfb = _parse_frames(bitstream)
+        parsed_frames, sample_rate, num_sfb, is_adts = _parse_frames(bitstream)
 
         if not parsed_frames:
             return DecoderResult(
@@ -115,9 +117,14 @@ def _decode_cpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
 
         decoded_frames = []
         for (payload,) in parsed_frames:
-            quantized, scalefactors, global_gain = decode_spectral_data(
-                payload, sample_rate
-            )
+            if is_adts:
+                quantized, scalefactors, global_gain = decode_raw_data_block_iso(
+                    payload, sample_rate
+                )
+            else:
+                quantized, scalefactors, global_gain = decode_spectral_data(
+                    payload, sample_rate
+                )
             decoded_frames.append((quantized, scalefactors, global_gain))
     timings["huffman_bitstream"] = t.elapsed
 
@@ -134,7 +141,10 @@ def _decode_cpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
             all_sf[i, : len(sf)] = sf[:num_sfb]
             all_gain[i] = g
 
-        mdct_coeffs = dequantize_cpu(all_quantized, all_sf, all_gain, sample_rate)
+        if is_adts:
+            mdct_coeffs = dequantize_iso_cpu(all_quantized, all_sf, sample_rate)
+        else:
+            mdct_coeffs = dequantize_cpu(all_quantized, all_sf, all_gain, sample_rate)
     timings["dequantization"] = t.elapsed
 
     # IMDCT
@@ -163,7 +173,7 @@ def _decode_gpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
     timings = {}
 
     with Timer() as t:
-        parsed_frames, sample_rate, num_sfb = _parse_frames(bitstream)
+        parsed_frames, sample_rate, num_sfb, is_adts = _parse_frames(bitstream)
 
         if not parsed_frames:
             return DecoderResult(
@@ -175,26 +185,40 @@ def _decode_gpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
 
         n_coeffs = config.frame_size // 2
 
-        try:
-            payloads = [p for (p,) in parsed_frames]
-            all_quantized, all_sf, all_gain = decode_frames_metal(
-                payloads, n_coeffs, num_sfb
-            )
-        except (OSError, RuntimeError, FileNotFoundError):
+        if is_adts:
             decoded_frames = []
             for (payload,) in parsed_frames:
-                quantized, scalefactors, global_gain = decode_spectral_data(
+                quantized, scalefactors, global_gain = decode_raw_data_block_iso(
                     payload, sample_rate
                 )
                 decoded_frames.append((quantized, scalefactors, global_gain))
-
             all_quantized = np.zeros((len(decoded_frames), n_coeffs), dtype=np.int32)
-            all_sf = np.zeros((len(decoded_frames), header.num_sfb), dtype=np.int32)
+            all_sf = np.zeros((len(decoded_frames), num_sfb), dtype=np.int32)
             all_gain = np.zeros(len(decoded_frames), dtype=np.int32)
             for i, (q, sf, g) in enumerate(decoded_frames):
                 all_quantized[i, : len(q)] = q[:n_coeffs]
                 all_sf[i, : len(sf)] = sf[:num_sfb]
                 all_gain[i] = g
+        else:
+            try:
+                payloads = [p for (p,) in parsed_frames]
+                all_quantized, all_sf, all_gain = decode_frames_metal(
+                    payloads, n_coeffs, num_sfb
+                )
+            except (OSError, RuntimeError, FileNotFoundError):
+                decoded_frames = []
+                for (payload,) in parsed_frames:
+                    quantized, scalefactors, global_gain = decode_spectral_data(
+                        payload, sample_rate
+                    )
+                    decoded_frames.append((quantized, scalefactors, global_gain))
+                all_quantized = np.zeros((len(decoded_frames), n_coeffs), dtype=np.int32)
+                all_sf = np.zeros((len(decoded_frames), num_sfb), dtype=np.int32)
+                all_gain = np.zeros(len(decoded_frames), dtype=np.int32)
+                for i, (q, sf, g) in enumerate(decoded_frames):
+                    all_quantized[i, : len(q)] = q[:n_coeffs]
+                    all_sf[i, : len(sf)] = sf[:num_sfb]
+                    all_gain[i] = g
     timings["huffman_bitstream"] = t.elapsed
 
     num_frames = len(parsed_frames)
@@ -203,26 +227,27 @@ def _decode_gpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
 
     # Dequantize on GPU
     with Timer() as t:
-        # Precompute per-coefficient gain factors for each frame
-        all_inv_gains = np.zeros((num_frames, n_coeffs), dtype=np.float32)
-        for i in range(num_frames):
-            _, inv_gains = precompute_sf_gains(
-                int(all_gain[i]),
-                all_sf[i],
-                sfb_offsets,
-                n_coeffs,
-            )
-            all_inv_gains[i] = inv_gains
-
         q_mx = mx.array(all_quantized)
-        inv_gains_mx = mx.array(all_inv_gains)
-
-        mdct_mx = dequantize_gpu(q_mx, inv_gains_mx[0])
-        # Per-frame varying gains: process in batch with broadcast
         q_float = q_mx.astype(mx.float32)
         signs = mx.sign(q_float)
         abs_q = mx.abs(q_float)
-        mdct_mx = signs * mx.power(abs_q, 4.0 / 3.0) * mx.array(all_inv_gains)
+
+        if is_adts:
+            sfb_map = np.zeros(n_coeffs, dtype=np.int32)
+            for sb in range(min(num_sfb, len(sfb_offsets) - 1)):
+                lo, hi = sfb_offsets[sb], min(sfb_offsets[sb + 1], n_coeffs)
+                sfb_map[lo:hi] = sb
+            per_coeff_sf = all_sf[:, sfb_map].astype(np.float32)
+            scale = np.power(2.0, (per_coeff_sf - 200.0) / 4.0)
+            mdct_mx = signs * mx.power(abs_q, 4.0 / 3.0) * mx.array(scale)
+        else:
+            all_inv_gains = np.zeros((num_frames, n_coeffs), dtype=np.float32)
+            for i in range(num_frames):
+                _, inv_gains = precompute_sf_gains(
+                    int(all_gain[i]), all_sf[i], sfb_offsets, n_coeffs,
+                )
+                all_inv_gains[i] = inv_gains
+            mdct_mx = signs * mx.power(abs_q, 4.0 / 3.0) * mx.array(all_inv_gains)
         mx.eval(mdct_mx)
     timings["dequantization"] = t.elapsed
 
