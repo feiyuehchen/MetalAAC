@@ -5,6 +5,22 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-04
+
+### Changed
+- **Clipping-aware per-band SF allocation**: quantizer now computes per-band safe SF
+  from peak amplitude (avoids q > 200 clipping), then binary-searches sf_base over
+  [100, 255] to fill bit budget. Signal bands are pinned at their safe SF; noise-floor
+  bands follow sf_base downward, becoming non-zero to contribute bits.
+- Binary search widened from [170, 210] to [100, 255] with 12 iterations.
+
+### Quality (ADTS path, ffmpeg decode)
+- 440 Hz sine: **SNR = 51.5 dB** (was 46.6 dB), **bitrate = 107 kbps** (was 10 kbps)
+- 1 kHz sine: **SNR = 50.6 dB** (was 46.9 dB), **bitrate = 106 kbps** (was 10 kbps)
+- Multi-tone: **SNR = 50.2 dB** (was 34.8 dB), **bitrate = 112 kbps** (was 17 kbps)
+- Music: **SNR = 46.1 dB**, **bitrate = 112 kbps**
+- Average nonzero coefficients per frame: **~500** (was ~10-30)
+
 ## [0.6.1] - 2026-06-04
 
 ### Changed

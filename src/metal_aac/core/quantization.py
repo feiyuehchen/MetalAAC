@@ -295,17 +295,16 @@ def quantize_batch_gpu(
     masking_thresholds: mx.array,
     target_bits_per_frame: int,
     sample_rate: int = 44100,
-    max_iterations: int = 8,
+    max_iterations: int = 12,
 ) -> QuantizationResult:
-    """ISO-native quantizer: uses sf as the ONLY parameter per band.
+    """ISO-native quantizer with clipping-aware per-band SF allocation.
 
-    ISO formula: q = nint((|x| * 2^((200-sf)/4))^0.75)
-    ISO dequant: x_hat = |q|^(4/3) * 2^((sf-200)/4)
-    Round-trip error is ONLY from integer rounding.
+    Each band's SF is set to max(sf_base, safe_sf[band]):
+    - safe_sf[band]: minimum SF to avoid q > 255 (from band's peak amplitude)
+    - sf_base: uniform floor controlled by binary search to meet bit budget
 
-    Rate control: binary search on a uniform sf_offset applied to all bands.
-    Per-band differentiation via SMR-based relative offsets.
-    All vectorized across (B, N) via MLX.
+    Signal bands (large coefficients) are pinned at their safe_sf.
+    Noise-floor bands follow sf_base downward, becoming non-zero to fill bits.
     """
     batch, n_coeffs = mdct_coeffs.shape
     sfb_offsets = get_sfb_offsets(sample_rate)
@@ -313,53 +312,49 @@ def quantize_batch_gpu(
     sfb_map = _build_sfb_map(sfb_offsets, n_coeffs)
     sfb_map_mx = mx.array(sfb_map)
 
-    # Step 1: per-band SMR → relative SF offsets.
-    # High SMR (loud signal, low masking) → lower sf → finer quantization.
-    band_powers = mx.zeros((batch, num_sfb))
+    abs_coeffs = mx.abs(mdct_coeffs)
+
+    # Step 1: per-band safe SF — minimum SF to keep max|q| ≤ 200 (headroom below 255).
+    # q = (|x_max| * 2^((200-sf)/4))^0.75 ≤ 200
+    # |x_max| * 2^((200-sf)/4) ≤ 200^(4/3) ≈ 1516
+    # sf ≥ 200 - 4 * log2(1516 / |x_max|)
+    q_headroom = 200.0
+    q_limit = q_headroom ** (4.0 / 3.0)
+    band_max = mx.zeros((batch, num_sfb))
     for sb in range(num_sfb):
         lo, hi = sfb_offsets[sb], sfb_offsets[sb + 1]
-        band_powers = band_powers.at[:, sb].add(
-            mx.mean(mdct_coeffs[:, lo:hi] ** 2, axis=-1) + 1e-20
+        band_max = band_max.at[:, sb].add(
+            mx.max(abs_coeffs[:, lo:hi], axis=-1)
         )
+    safe_sf = mx.ceil(200.0 - 4.0 * mx.log2(q_limit / (band_max + 1e-20)))
+    safe_sf = mx.clip(safe_sf, 100, 255).astype(mx.int32)
+    mx.eval(safe_sf)
 
-    masking_safe = mx.maximum(masking_thresholds, 1e-20)
-    masking_safe = mx.where(mx.isnan(masking_safe), band_powers, masking_safe)
-    smr_db = 10.0 * mx.log10(band_powers / masking_safe)
-    smr_db = mx.where(mx.isnan(smr_db), mx.zeros_like(smr_db), smr_db)
-
-    # Relative offsets: high SMR → negative (lower sf = finer)
-    sf_rel = mx.clip(-smr_db * 0.15, -20, 0).astype(mx.int32)
-    mx.eval(sf_rel)
-
-    abs_coeffs = mx.abs(mdct_coeffs)
     target = mx.array(target_bits_per_frame, dtype=mx.float32)
 
-    # Step 2: binary search on sf_base (uniform level) to meet bit budget.
-    # iso_sf[band] = sf_base + sf_rel[band], clamped to [100, 255].
-    # Lower sf_base → larger q → more bits.
-    sf_base_lo = mx.full((batch,), 170, dtype=mx.int32)
-    sf_base_hi = mx.full((batch,), 210, dtype=mx.int32)
+    # Step 2: binary search on sf_base to meet bit budget.
+    # per_band_sf = max(sf_base, safe_sf) — signal bands stay at safe_sf,
+    # noise bands follow sf_base downward to contribute more bits.
+    sf_base_lo = mx.full((batch,), 100, dtype=mx.int32)
+    sf_base_hi = mx.full((batch,), 255, dtype=mx.int32)
     best_sf_base = mx.full((batch,), 200, dtype=mx.int32)
     best_bits = mx.zeros(batch, dtype=mx.float32)
 
     for _ in range(max_iterations):
         sf_base = (sf_base_lo + sf_base_hi) // 2
 
-        # Per-coefficient ISO sf
-        per_band_sf = mx.clip(sf_base[:, None] + sf_rel, 100, 255)
+        per_band_sf = mx.maximum(sf_base[:, None], safe_sf)
+        per_band_sf = mx.clip(per_band_sf, 100, 255)
         per_coeff_sf = per_band_sf[:, sfb_map_mx].astype(mx.float32)
 
-        # ISO quantize: q = nint((|x| * 2^((200-sf)/4))^0.75)
         iqf = mx.power(2.0, (200.0 - per_coeff_sf) / 4.0)
         scaled = abs_coeffs * iqf
         q = mx.sign(mdct_coeffs) * mx.round(mx.power(scaled + 1e-20, 0.75))
         q_int = mx.clip(q, -255, 255).astype(mx.int32)
 
         bits = _gpu_estimate_bits(q_int)
-        max_abs_q = mx.max(mx.abs(q_int), axis=-1)
 
-        # Lower sf = more bits. Find LOWEST sf where bits <= target.
-        fits = (bits <= target) & (max_abs_q <= 255)
+        fits = bits <= target
         best_sf_base = mx.where(fits, sf_base, best_sf_base)
         best_bits = mx.where(fits, bits, best_bits)
         sf_base_hi = mx.where(fits, sf_base - 1, sf_base_hi)
@@ -367,7 +362,8 @@ def quantize_batch_gpu(
         mx.eval(sf_base_lo, sf_base_hi, best_sf_base, best_bits)
 
     # Step 3: final quantization with best sf_base
-    final_sf = mx.clip(best_sf_base[:, None] + sf_rel, 100, 255)
+    final_sf = mx.maximum(best_sf_base[:, None], safe_sf)
+    final_sf = mx.clip(final_sf, 100, 255)
     per_coeff_sf_final = final_sf[:, sfb_map_mx].astype(mx.float32)
     iqf_final = mx.power(2.0, (200.0 - per_coeff_sf_final) / 4.0)
     scaled_final = abs_coeffs * iqf_final
@@ -375,14 +371,12 @@ def quantize_batch_gpu(
     final_q = mx.clip(final_q, -255, 255).astype(mx.int32)
     mx.eval(final_q, final_sf)
 
-    # Return: iso_scalefactors are the DIRECT ISO sf values (no mapping needed).
-    # global_gain = mean of ISO SFs for DPCM anchoring.
     iso_sf_np = np.array(final_sf)
     iso_gg = np.mean(iso_sf_np, axis=-1).astype(np.int32)
 
     return QuantizationResult(
         quantized=np.array(final_q),
-        scalefactors=iso_sf_np,  # NOW direct ISO SF values
-        global_gain=iso_gg,      # NOW direct ISO global_gain
+        scalefactors=iso_sf_np,
+        global_gain=iso_gg,
         total_bits=np.array(best_bits, dtype=np.int32),
     )
