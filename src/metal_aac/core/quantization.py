@@ -327,31 +327,27 @@ def quantize_batch_gpu(
     )
     smr_db = 10.0 * mx.log10(band_powers / masking_safe)
     smr_db = mx.where(mx.isnan(smr_db), mx.zeros_like(smr_db), smr_db)
-    # Lower SF = finer quantization = more bits. Cap at 40 (was 60) so
-    # quiet bands still get some non-zero q values, using more of the bit budget.
     scalefactors = mx.clip(40 - smr_db * 0.15, 0, 40).astype(mx.int32)
     mx.eval(scalefactors)
 
-    # Step 2: vectorized binary search across ALL frames
-    per_coeff_sf = scalefactors[:, sfb_map_mx]  # (B, N)
+    # Step 2: vectorized binary search for global_gain across ALL frames
+    per_coeff_sf = scalefactors[:, sfb_map_mx]
     abs_coeffs = mx.abs(mdct_coeffs)
     powered = mx.power(abs_coeffs + 1e-20, 0.75)
     mx.eval(per_coeff_sf, powered)
+    target = mx.array(target_bits_per_frame, dtype=mx.float32)
 
     gain_lo = mx.zeros(batch, dtype=mx.int32)
     gain_hi = mx.full((batch,), 255, dtype=mx.int32)
     best_gains = mx.zeros(batch, dtype=mx.int32)
     best_bits = mx.zeros(batch, dtype=mx.float32)
-    target = mx.array(target_bits_per_frame, dtype=mx.float32)
 
     for _ in range(max_iterations):
         gains = (gain_lo + gain_hi) // 2
-
         gain_factor = mx.power(
             2.0, (gains[:, None].astype(mx.float32) - per_coeff_sf * 4) / 16.0
         )
         q = mx.sign(mdct_coeffs) * mx.floor(powered * gain_factor + 0.4054)
-
         q_int = q.astype(mx.int32)
         bits = _gpu_estimate_bits(q_int)
         max_abs = mx.max(mx.abs(q_int), axis=-1)
