@@ -197,14 +197,15 @@ def encode_raw_data_block(
     quantized = np.clip(quantized, -255, 255)
 
     # Compute ISO scalefactors and derive the correct global_gain for the header.
-    # ISO decoder: x_hat = |q|^(4/3) * 2^(0.25*(sf-100))
+    # ffmpeg decoder: scale = 2^((sf - POW_SF2_ZERO) / 4) where POW_SF2_ZERO=200
     # Our quantizer: q = |x|^(3/4) * 2^((gg - internal_sf*4)/16)
-    # For round-trip: iso_sf = 100 - (gg - internal_sf*4) / 3
+    # For round-trip: iso_sf = 157 - (gg - internal_sf*4) / 3
+    # (157 = 200 - 4*log2(MDCT_norm_ratio), compensating for unnormalized MDCT)
     sections = _compute_sections(quantized, sfb_offsets)
     iso_sfs = [max(0, min(255, int(round(157 - (global_gain - int(scalefactors[sb])*4) / 3.0)))) for sb in range(num_sfb)]
     non_zero_sfs = [iso_sfs[sb] for sb in range(num_sfb)
                     if any(s <= sb < e and cb != ZERO_HCB for s, e, cb in sections)]
-    iso_global_gain = int(np.median(non_zero_sfs)) if non_zero_sfs else 100
+    iso_global_gain = int(np.mean(non_zero_sfs)) if non_zero_sfs else 100
 
     bw = BitWriter()
 
@@ -265,7 +266,7 @@ def encode_raw_data_block(
             bw.write(cw, cl)
         else:
             bw.write(0, 1)
-        prev_sf = iso_sfs[sb]
+        prev_sf += diff  # track decoder's actual state, not intended value
 
     # ---- pulse_data ----
     bw.write(0, 1)  # pulse_data_present = 0

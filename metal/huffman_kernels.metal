@@ -551,7 +551,9 @@ kernel void kernel_encode_raw_data_block(
         int iso_sum = 0;
         for (int sb = 0; sb < num_sfb; sb++) {
             int sf_int = scalefactors[b * num_sfb + sb];
-            int isf = 157 - (gg - sf_int * 4) / 3;
+            // Round to nearest (match Python's round()) instead of truncating
+            int num = gg - sf_int * 4;
+            int isf = 157 - (num >= 0 ? (num + 1) / 3 : (num - 1) / 3);
             if (isf < 0) isf = 0;
             if (isf > 255) isf = 255;
             iso_sf_arr[sb] = isf;
@@ -601,7 +603,7 @@ kernel void kernel_encode_raw_data_block(
             int idx = diff + 60;
             HuffEntry e = sf_lut[idx];
             write_bits_seq(raw, bp, e.code, e.bits); bp += e.bits;
-            prev_sf = iso_sf_arr[sb];
+            prev_sf += diff;  // track decoder's actual state after clamp
         }
 
         // pulse/tns/gain control
