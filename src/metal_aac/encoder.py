@@ -38,6 +38,7 @@ from metal_aac.core.huffman import (
     encode_frames_parallel,
     encode_spectral_data,
 )
+from metal_aac.core.raw_data_block import encode_raw_data_block
 from metal_aac.core.mdct import (
     MDCTBasis,
     MDCTBasisGPU,
@@ -265,8 +266,14 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
     # ---- Bitstream assembly ----
     if config.output_format == "adts":
         writer = ADTSWriter(config.sample_rate, 1)
-        for spectral_bytes in encoded_frames:
-            writer.write_frame(spectral_bytes)
+        # Use standard raw_data_block encoding (ISO Huffman codebooks)
+        for i in range(len(encoded_frames)):
+            rdb = encode_raw_data_block(
+                q[i], sf[i], int(gg[i]),
+                window_sequence=int(window_seqs[i]),
+                sample_rate=config.sample_rate,
+            )
+            writer.write_frame(rdb)
     else:
         writer = BitstreamWriter()
         num_sfb = get_num_sfb(config.sample_rate)

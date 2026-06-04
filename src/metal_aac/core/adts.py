@@ -58,7 +58,7 @@ def write_adts_header(
 
     # Byte 0-1: syncword(12) + id(1) + layer(2) + protection_absent(1)
     b0 = 0xFF
-    b1 = 0xF0 | (0 << 3) | (0 << 1) | 1  # id=0(MPEG4), layer=00, prot=1(noCRC)
+    b1 = 0xF0 | (1 << 3) | (0 << 1) | 1  # id=1(MPEG2), layer=00, prot=1(noCRC)
 
     # Byte 2: profile(2) + sf_index(4) + private(1) + channel_config_hi(1)
     b2 = ((profile & 0x3) << 6) | ((sf_index & 0xF) << 2) | (0 << 1) | ((channel_config >> 2) & 0x1)
