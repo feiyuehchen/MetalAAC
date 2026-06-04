@@ -213,6 +213,27 @@ Notes:
 
 ---
 
+## v0.7.0 ADTS Quality (ffmpeg decode, clipping-aware rate allocation)
+
+| Signal | SNR (dB) | Bitrate (kbps) | Avg nonzero q |
+|--------|----------|----------------|---------------|
+| sine_440 | 51.5 | 107.2 | 478 |
+| sine_1k | 50.6 | 105.9 | 463 |
+| sine_4k | 49.1 | 115.1 | 547 |
+| multitone | 50.2 | 111.9 | 419 |
+| chirp | 50.5 | 109.0 | 509 |
+| white_noise | 10.2 | 133.7 | 753 |
+| pink_noise | 16.2 | 135.4 | 726 |
+| music_1min | 46.1 | 111.6 | 514 |
+
+Notes:
+- Target bitrate: 128 kbps. Actual varies 105-136 kbps due to exp-Golomb bit estimation
+  vs actual Huffman coding in ADTS bitstream.
+- SNR improved from v0.6.x (46.6→51.5 dB for 440 Hz) because signal bands get stable
+  quality via clipping constraint while noise-floor bits are perceptually invisible.
+- Noise signals (white/pink) have inherently low SNR since reconstruction of wideband
+  noise requires extreme bit density.
+
 ## Abandoned Directions
 
 ### GPU precomputed codewords + multiprocess packing
