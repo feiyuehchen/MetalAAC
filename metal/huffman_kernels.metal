@@ -459,29 +459,6 @@ struct HuffEntry {
     uint8_t  pad[3];
 };
 
-// Helper: write `len` bits of `cw` at `bit_pos` into atomic uint32 buffer
-inline void write_bits(
-    threadgroup atomic_uint* buf,
-    uint32_t bit_pos,
-    uint32_t cw,
-    uint16_t len)
-{
-    if (len == 0) return;
-    uint32_t word_idx = bit_pos / 32u;
-    uint32_t bit_in_word = bit_pos % 32u;
-
-    if (bit_in_word + (uint)len <= 32u) {
-        uint32_t shift = 32u - bit_in_word - (uint)len;
-        atomic_fetch_or_explicit(&buf[word_idx], cw << shift, memory_order_relaxed);
-    } else {
-        uint32_t bits_first = 32u - bit_in_word;
-        atomic_fetch_or_explicit(&buf[word_idx], cw >> ((uint)len - bits_first), memory_order_relaxed);
-        uint32_t remaining = (uint)len - bits_first;
-        uint32_t mask2 = (cw & ((1u << remaining) - 1u)) << (32u - remaining);
-        atomic_fetch_or_explicit(&buf[word_idx + 1u], mask2, memory_order_relaxed);
-    }
-}
-
 // Helper: write a fixed-width field using thread 0 (non-atomic, sequential)
 inline void write_bits_seq(
     threadgroup uint32_t* buf,
@@ -617,74 +594,12 @@ kernel void kernel_encode_raw_data_block(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- All threads: spectral_data (pair encoding) ----
-    // Each thread encodes one coefficient pair (tid covers 0..511 pairs)
-    uint hbits = header_bits;
-
-    if (tid < (uint)N / 2u) {
-        uint coeff_idx = tid * 2u;
-        int lo_sfb = -1;
-        int cb = 0;
-
-        // Find which SFB this pair belongs to and its codebook
-        for (int sb = 0; sb < num_sfb; sb++) {
-            uint slo = (uint)sfb_offsets_buf[sb];
-            uint shi = (uint)sfb_offsets_buf[sb + 1];
-            if (coeff_idx >= slo && coeff_idx < shi) {
-                cb = sfb_cb[sb];
-                break;
-            }
-        }
-
-        if (cb != 0 && cb >= 1 && cb <= 11) {
-            int v0 = quantized[b * N + coeff_idx];
-            int v1 = quantized[b * N + coeff_idx + 1];
-
-            // Clamp
-            if (v0 > 255) v0 = 255; if (v0 < -255) v0 = -255;
-            if (v1 > 255) v1 = 255; if (v1 < -255) v1 = -255;
-
-            int is_signed = cb_signed[cb];
-            int dim = cb_dims[cb];
-            int mabs = cb_max_abs[cb];
-            int cb_off = cb_offsets[cb];
-
-            // For pair codebooks (dim=2)
-            if (dim == 2) {
-                int a0, a1;
-                if (is_signed) {
-                    a0 = v0; a1 = v1;
-                } else {
-                    a0 = (v0 >= 0) ? v0 : -v0;
-                    a1 = (v1 >= 0) ? v1 : -v1;
-                    if (cb == 11) {
-                        if (a0 > 16) a0 = 16;
-                        if (a1 > 16) a1 = 16;
-                    } else {
-                        if (a0 > mabs) a0 = mabs;
-                        if (a1 > mabs) a1 = mabs;
-                    }
-                }
-
-                int dim_size = is_signed ? (2 * mabs + 1) : (mabs + 1);
-                int lookup_a0 = is_signed ? (a0 + mabs) : a0;
-                int lookup_a1 = is_signed ? (a1 + mabs) : a1;
-                int idx = lookup_a0 * dim_size + lookup_a1;
-                HuffEntry e = cb_luts[cb_off + idx];
-
-                // For now, store codeword + length per thread for later packing
-                // We'll use a simpler approach: thread 0 handles all spectral sequentially
-                // (proper parallel scatter would need prefix sum on variable-length codes)
-            }
-        }
-    }
-
-    // ---- Thread 0: sequential spectral encoding (simpler, still GPU-fast) ----
+    // ---- Thread 0: sequential spectral encoding ----
     // Each frame's spectral data is small (<500 bytes), sequential on one GPU
     // thread is fast enough. The win is from running B frames in parallel.
     if (tid == 0u) {
         threadgroup uint32_t* raw = (threadgroup uint32_t*)shared_words;
-        uint bp = hbits;
+        uint bp = header_bits;
 
         for (int sb = 0; sb < num_sfb; sb++) {
             int cb = sfb_cb[sb];
@@ -768,7 +683,7 @@ kernel void kernel_encode_raw_data_block(
                             if (orig0 >= 16) {
                                 int n = orig0;
                                 int count = 0;
-                                while (n >= (1 << (count + 5))) count++;
+                                while (n >= (1 << (count + 4))) count++;
                                 for (int c = 0; c < count; c++) {
                                     write_bits_seq(raw, bp, 1, 1); bp += 1;
                                 }
@@ -778,7 +693,7 @@ kernel void kernel_encode_raw_data_block(
                             if (orig1 >= 16) {
                                 int n = orig1;
                                 int count = 0;
-                                while (n >= (1 << (count + 5))) count++;
+                                while (n >= (1 << (count + 4))) count++;
                                 for (int c = 0; c < count; c++) {
                                     write_bits_seq(raw, bp, 1, 1); bp += 1;
                                 }

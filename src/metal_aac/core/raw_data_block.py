@@ -160,12 +160,14 @@ def _encode_spectral_quad(
 
 
 def _write_escape(bw: BitWriter, value: int) -> None:
-    """Write escape-coded value for CB 11 (values >= 16)."""
-    # Escape: count = floor(log2(value)) - 4, then write count 1-bits,
-    # one 0-bit, then (count+4) bits of the value
+    """Write escape-coded value for CB 11 (values >= 16).
+
+    ISO 14496-3 Section 4.6.3.3: write N ones + 0 + (N+4) bits of value,
+    where N = floor(log2(value)) - 3, i.e. 2^(N+4) > value.
+    """
     n = value
     count = 0
-    while n >= (1 << (count + 5)):
+    while n >= (1 << (count + 4)):
         count += 1
     for _ in range(count):
         bw.write(1, 1)
@@ -219,17 +221,21 @@ def encode_raw_data_block(
 
     # ---- section_data ----
     sections = _compute_sections(quantized, sfb_offsets)
-    sect_esc_val = 31 if window_sequence == 2 else 31
-    # For long windows, sect_esc_val would be 31 (2^5-1) per the standard
-    # but we use simplified sectioning here
+    # ISO: short windows use 3-bit section lengths (esc=7), long use 5-bit (esc=31)
+    if window_sequence == 2:
+        sect_esc_val = 7
+        sect_bits = 3
+    else:
+        sect_esc_val = 31
+        sect_bits = 5
 
     for start_sfb, end_sfb, cb in sections:
         sect_len = end_sfb - start_sfb
         bw.write(cb & 0xF, 4)  # sect_cb
         while sect_len >= sect_esc_val:
-            bw.write(sect_esc_val, 5)
+            bw.write(sect_esc_val, sect_bits)
             sect_len -= sect_esc_val
-        bw.write(sect_len, 5)
+        bw.write(sect_len, sect_bits)
 
     # ---- scale_factor_data ----
     # Convert internal scalefactors to ISO DPCM.

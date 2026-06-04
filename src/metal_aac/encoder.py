@@ -96,23 +96,8 @@ class EncoderResult:
     timings: dict[str, float] = field(default_factory=dict)
 
 
-def _encode_rdb_chunk(args):
-    """Encode a chunk of frames as raw_data_blocks (for multiprocessing)."""
-    q_chunk, sf_chunk, gg_chunk, ws_chunk, sr = args
-    results = []
-    for i in range(len(q_chunk)):
-        rdb = encode_raw_data_block(
-            q_chunk[i], sf_chunk[i], int(gg_chunk[i]),
-            window_sequence=int(ws_chunk[i]),
-            sample_rate=sr,
-        )
-        results.append(rdb)
-    return results
-
-
 def _encode_adts_frames(writer, q, sf, gg, window_seqs, config):
-    """Encode all frames as ADTS with multiprocessing."""
-    import os
+    """CPU fallback: encode all frames as ADTS raw_data_blocks."""
     n_frames = len(q)
     for i in range(n_frames):
         rdb = encode_raw_data_block(
@@ -177,19 +162,25 @@ def _encode_cpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
     with Timer() as t:
         if config.output_format == "adts":
             writer = ADTSWriter(config.sample_rate, 1)
+            for i in range(num_frames):
+                rdb = encode_raw_data_block(
+                    quant_result.quantized[i],
+                    quant_result.scalefactors[i],
+                    int(quant_result.global_gain[i]),
+                    window_sequence=int(window_seqs[i]),
+                    sample_rate=config.sample_rate,
+                )
+                writer.write_frame(rdb)
         else:
             writer = BitstreamWriter()
-        num_sfb = get_num_sfb(config.sample_rate)
-        for i in range(num_frames):
-            spectral_bytes = encode_spectral_data(
-                quant_result.quantized[i],
-                quant_result.scalefactors[i],
-                int(quant_result.global_gain[i]),
-                config.sample_rate,
-            )
-            if config.output_format == "adts":
-                writer.write_frame(spectral_bytes)
-            else:
+            num_sfb = get_num_sfb(config.sample_rate)
+            for i in range(num_frames):
+                spectral_bytes = encode_spectral_data(
+                    quant_result.quantized[i],
+                    quant_result.scalefactors[i],
+                    int(quant_result.global_gain[i]),
+                    config.sample_rate,
+                )
                 writer.write_frame(spectral_bytes, config.sample_rate, 1, num_sfb)
     timings["huffman_bitstream"] = t.elapsed
 

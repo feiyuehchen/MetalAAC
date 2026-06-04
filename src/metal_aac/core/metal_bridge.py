@@ -124,51 +124,29 @@ class MetalHuffman:
         num_sfb = len(sfb_offsets) - 1
         max_bytes = self._lib.metal_huffman_max_frame_bytes(N, num_sfb)
 
-        # Build codebook LUTs as flat array of (code, bits, pad, pad)
-        # Each entry is 4 bytes: uint16 code + uint8 bits + uint8 pad
-        cb_entries = []
-        cb_offsets_arr = [0] * 12  # index 0 unused, 1-11 are codebooks
         cb_dims_arr = [0, 4, 4, 4, 4, 2, 2, 2, 2, 2, 2, 2]
         cb_signed_arr = [0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0]
         cb_max_abs_arr = [0, 1, 1, 2, 2, 4, 4, 7, 7, 12, 12, 16]
 
-        offset = 0
-        for cb_idx in range(12):
-            cb_offsets_arr[cb_idx] = offset
-            if cb_idx == 0 or cb_idx not in CODEBOOKS:
-                continue
-            cb = CODEBOOKS[cb_idx]
-            n_entries = len(cb.lengths)
-            for i in range(n_entries):
-                code = cb.lengths[i]  # will be replaced below
-                cb_entries.append(0)  # placeholder
-            offset += n_entries
-
-        # Rebuild with actual codes from the codebook's raw arrays
-        # HuffEntry: uint32 code (4) + uint8 bits (1) + pad[3] (3) = 8 bytes
+        # Build codebook LUTs: HuffEntry = uint32 code + uint8 bits + pad[3] = 8 bytes
         import struct as st
-        lut_data = bytearray()
         from metal_aac.tables import huffman_tables as ht
+
+        sizes = [0, 81, 81, 81, 81, 81, 81, 64, 64, 169, 169, 289]
+        cb_offsets_arr = [0] * 12
+        for i in range(2, 12):
+            cb_offsets_arr[i] = cb_offsets_arr[i - 1] + sizes[i - 1]
+
+        lut_data = bytearray()
         for cb_idx in range(1, 12):
             codes_arr = getattr(ht, f'CB{cb_idx}_CODES')
             bits_arr = getattr(ht, f'CB{cb_idx}_LENGTHS')
             for i in range(len(codes_arr)):
                 lut_data += st.pack('<IB3x', codes_arr[i], bits_arr[i])
 
-        # SF LUT (121 entries, 8 bytes each)
         sf_lut_data = bytearray()
         for i in range(121):
             sf_lut_data += st.pack('<IB3x', SF_CODE_VALUES[i], SF_CODE_LENGTHS[i])
-
-        # Recompute cb_offsets based on actual sizes
-        cb_offsets_arr = [0] * 12
-        sizes = [0, 81, 81, 81, 81, 81, 81, 64, 64, 169, 169, 289]
-        for i in range(1, 12):
-            cb_offsets_arr[i] = cb_offsets_arr[i-1] + sizes[i-1] if i > 1 else 0
-        # Fix: CB1 starts at 0
-        cb_offsets_arr[1] = 0
-        for i in range(2, 12):
-            cb_offsets_arr[i] = cb_offsets_arr[i-1] + sizes[i-1]
 
         q = np.ascontiguousarray(quantized, dtype=np.int32)
         sf = np.ascontiguousarray(scalefactors, dtype=np.int32)
