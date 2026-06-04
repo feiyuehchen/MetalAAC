@@ -142,6 +142,34 @@ def imdct_gpu(
     return mx.matmul(spectra, basis.inverse)
 
 
+def mdct_short_gpu(
+    frames: mx.array, basis_short: MDCTBasisGPU | None = None
+) -> mx.array:
+    """Short-window MDCT for EIGHT_SHORT_SEQUENCE.
+
+    frames: (B, 2048) → reshape to (B*8, 256) → MDCT → (B, 8, 128).
+    Each of the 8 sub-frames of 256 samples produces 128 MDCT coefficients.
+    """
+    B = frames.shape[0]
+    if basis_short is None:
+        basis_short = MDCTBasisGPU(256)
+    sub_frames = mx.reshape(frames, (B * 8, 256))
+    spectra = mx.matmul(sub_frames, basis_short.forward)
+    return mx.reshape(spectra, (B, 8, 128))
+
+
+def imdct_short_gpu(
+    spectra: mx.array, basis_short: MDCTBasisGPU | None = None
+) -> mx.array:
+    """Short-window IMDCT. spectra: (B, 8, 128) -> (B, 2048)."""
+    B = spectra.shape[0]
+    if basis_short is None:
+        basis_short = MDCTBasisGPU(256)
+    flat = mx.reshape(spectra, (B * 8, 128))
+    sub_frames = mx.matmul(flat, basis_short.inverse)
+    return mx.reshape(sub_frames, (B, 8, 256))
+
+
 class MDCTTwiddles:
     """Precomputed twiddle factors for FFT-based MDCT/IMDCT."""
 

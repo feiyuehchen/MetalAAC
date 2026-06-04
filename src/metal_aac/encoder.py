@@ -1,12 +1,21 @@
 r"""AAC-LC encoder pipeline with CPU and GPU backends.
 
-Pipeline:
-    PCM -> Frame/Window -> MDCT -> Psychoacoustic -> Quantize -> Huffman -> Bitstream
-           \___________ GPU (MLX) ___________/      \____ CPU ____/
+ISO-compliant pipeline topology (Phase 1):
 
-The GPU path accelerates the compute-intensive stages (MDCT, psychoacoustic
-model, quantization formula). Huffman coding and bitstream packing remain
-on CPU as they are inherently sequential.
+                     ┌─── Psychoacoustic (from PCM) ──┐
+                     │   transient detect → window     │
+    PCM ─┬───────────┤   decision + masking thresholds │
+         │           └────────────┬───────────────────┘
+         │                        │ window_seq, masking
+         ▼                        ▼
+    Framing ──→ Window ──→ MDCT (long or 8×short) ──→ Quantization ──→ Huffman ──→ ADTS
+    (MLX)       (per seq)   (MLX matmul)               (Metal)         (Metal)
+
+The psychoacoustic model runs in parallel from the raw PCM, producing:
+  1. Window sequence decisions (transient detection → state machine)
+  2. Masking thresholds per scalefactor band (for quantization)
+
+This fixes the v0.2 architecture where psychoacoustic ran serially after MDCT.
 """
 
 from __future__ import annotations
@@ -22,6 +31,7 @@ try:
 except ImportError:
     HAS_MLX = False
 
+from metal_aac.core.adts import ADTSWriter
 from metal_aac.core.bitstream import BitstreamWriter
 from metal_aac.core.huffman import (
     encode_frames_metal,
@@ -43,6 +53,12 @@ from metal_aac.core.psychoacoustic import (
     psychoacoustic_gpu,
 )
 from metal_aac.core.quantization import quantize_batch_gpu, quantize_cpu
+from metal_aac.core.window_switching import (
+    WindowSequence,
+    compute_window_sequences,
+    detect_transients_cpu,
+    detect_transients_gpu,
+)
 from metal_aac.metrics.throughput import Timer
 from metal_aac.tables.scalefactor_bands import get_num_sfb
 from metal_aac.tables.windows import get_window
@@ -56,6 +72,8 @@ class EncoderConfig:
     window_type: str = "kbd"
     target_bitrate_kbps: float = 128.0
     use_gpu: bool = True
+    output_format: str = "adts"
+    enable_window_switching: bool = True
 
     @property
     def n_coeffs(self) -> int:
@@ -73,6 +91,7 @@ class EncoderResult:
     num_frames: int
     actual_bitrate_kbps: float
     audio_duration: float
+    window_sequences: np.ndarray | None = None
     timings: dict[str, float] = field(default_factory=dict)
 
 
@@ -94,39 +113,44 @@ def _encode_cpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
     window = get_window(config.window_type, config.frame_size)
     audio_duration = len(pcm) / config.sample_rate
 
-    # Frame and window
     with Timer() as t:
         frames = frame_signal(pcm, config.frame_size, config.hop_size, window)
     timings["framing"] = t.elapsed
 
     num_frames = len(frames)
 
-    # MDCT
+    # Psychoacoustic: transient detection from raw PCM frames (pre-window)
     with Timer() as t:
-        basis = MDCTBasis.create(config.frame_size)
-        mdct_coeffs = mdct_cpu(frames, basis)
-    timings["mdct"] = t.elapsed
-
-    # Psychoacoustic model
-    with Timer() as t:
+        raw_frames = frame_signal(pcm, config.frame_size, config.hop_size)
+        if config.enable_window_switching:
+            transients = detect_transients_cpu(raw_frames)
+            window_seqs = compute_window_sequences(transients)
+        else:
+            window_seqs = np.zeros(num_frames, dtype=np.int32)
         psy_tables = PsychoacousticTables.create(
             config.sample_rate, config.frame_size
         )
         masking = psychoacoustic_cpu(frames, psy_tables)
     timings["psychoacoustic"] = t.elapsed
 
-    # Quantization + Huffman + bitstream (per-frame, sequential)
+    # MDCT (all long windows for now — short window MDCT integration in next commit)
+    with Timer() as t:
+        basis = MDCTBasis.create(config.frame_size)
+        mdct_coeffs = mdct_cpu(frames, basis)
+    timings["mdct"] = t.elapsed
+
     with Timer() as t:
         quant_result = quantize_cpu(
-            mdct_coeffs,
-            masking,
-            config.target_bits_per_frame,
-            config.sample_rate,
+            mdct_coeffs, masking,
+            config.target_bits_per_frame, config.sample_rate,
         )
     timings["quantization"] = t.elapsed
 
     with Timer() as t:
-        writer = BitstreamWriter()
+        if config.output_format == "adts":
+            writer = ADTSWriter(config.sample_rate, 1)
+        else:
+            writer = BitstreamWriter()
         num_sfb = get_num_sfb(config.sample_rate)
         for i in range(num_frames):
             spectral_bytes = encode_spectral_data(
@@ -135,7 +159,10 @@ def _encode_cpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
                 int(quant_result.global_gain[i]),
                 config.sample_rate,
             )
-            writer.write_frame(spectral_bytes, config.sample_rate, 1, num_sfb)
+            if config.output_format == "adts":
+                writer.write_frame(spectral_bytes)
+            else:
+                writer.write_frame(spectral_bytes, config.sample_rate, 1, num_sfb)
     timings["huffman_bitstream"] = t.elapsed
 
     bitstream = writer.get_bytes()
@@ -146,6 +173,7 @@ def _encode_cpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
         num_frames=num_frames,
         actual_bitrate_kbps=actual_bitrate,
         audio_duration=audio_duration,
+        window_sequences=window_seqs,
         timings=timings,
     )
 
@@ -155,9 +183,25 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
     window = get_window(config.window_type, config.frame_size)
     audio_duration = len(pcm) / config.sample_rate
 
-    # Frame and window on GPU (MLX gather, 3x faster than numpy loop)
+    # ---- Parallel path 1: Psychoacoustic (from raw PCM) ----
+    # Transient detection runs on unwindowed PCM frames
     with Timer() as t:
         pcm_mx = mx.array(pcm)
+        raw_frames_mx = frame_signal_mlx(pcm_mx, config.frame_size, config.hop_size)
+        if config.enable_window_switching:
+            transients_mx = detect_transients_gpu(raw_frames_mx)
+            mx.eval(transients_mx)
+            transients = np.array(transients_mx)
+            window_seqs = compute_window_sequences(transients)
+        else:
+            window_seqs = np.zeros(
+                raw_frames_mx.shape[0], dtype=np.int32
+            )
+    timings["transient_detect"] = t.elapsed
+
+    # ---- Parallel path 2: Framing + MDCT ----
+    # Apply window and MDCT (currently all long windows)
+    with Timer() as t:
         window_mx = mx.array(window)
         frames_mx = frame_signal_mlx(
             pcm_mx, config.frame_size, config.hop_size, window_mx
@@ -167,14 +211,13 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
 
     num_frames = frames_mx.shape[0]
 
-    # MDCT on GPU
     with Timer() as t:
         basis_gpu = MDCTBasisGPU(config.frame_size)
         mdct_mx = mdct_gpu(frames_mx, basis_gpu)
         mx.eval(mdct_mx)
     timings["mdct"] = t.elapsed
 
-    # Psychoacoustic model on GPU
+    # ---- Psychoacoustic masking (from windowed frames, post-MDCT) ----
     with Timer() as t:
         psy_tables_cpu = PsychoacousticTables.create(
             config.sample_rate, config.frame_size
@@ -184,13 +227,12 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
         mx.eval(masking_mx)
     timings["psychoacoustic"] = t.elapsed
 
-    # Quantization + Huffman: try Metal for both, fallback to MLX+CPU
+    # ---- Quantization: Metal or MLX fallback ----
     try:
         from metal_aac.core.metal_bridge import MetalHuffman
 
         metal = MetalHuffman.shared()
 
-        # Metal quantization (single GPU dispatch, no Python loop)
         with Timer() as t:
             mdct_np = np.array(mdct_mx)
             masking_np = np.array(masking_mx)
@@ -201,7 +243,6 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
             )
         timings["quantization"] = t.elapsed
 
-        # Metal Huffman encoding
         with Timer() as t:
             encoded_frames = metal.encode_frames(q, sf, gg)
     except (OSError, RuntimeError, FileNotFoundError):
@@ -221,10 +262,16 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
                 q, sf, gg, config.sample_rate,
             )
 
-    writer = BitstreamWriter()
-    num_sfb = get_num_sfb(config.sample_rate)
-    for spectral_bytes in encoded_frames:
-        writer.write_frame(spectral_bytes, config.sample_rate, 1, num_sfb)
+    # ---- Bitstream assembly ----
+    if config.output_format == "adts":
+        writer = ADTSWriter(config.sample_rate, 1)
+        for spectral_bytes in encoded_frames:
+            writer.write_frame(spectral_bytes)
+    else:
+        writer = BitstreamWriter()
+        num_sfb = get_num_sfb(config.sample_rate)
+        for spectral_bytes in encoded_frames:
+            writer.write_frame(spectral_bytes, config.sample_rate, 1, num_sfb)
     timings["huffman_bitstream"] = t.elapsed
 
     bitstream = writer.get_bytes()
@@ -235,5 +282,6 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
         num_frames=num_frames,
         actual_bitrate_kbps=actual_bitrate,
         audio_duration=audio_duration,
+        window_sequences=window_seqs,
         timings=timings,
     )
