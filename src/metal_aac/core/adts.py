@@ -70,7 +70,7 @@ def write_adts_header(
     b4 = (frame_length >> 3) & 0xFF
 
     # Byte 5: frame_length_lo(3) + buffer_fullness_hi(5)
-    buffer_fullness = 0x7FF  # VBR
+    buffer_fullness = 0  # 0 = CBR (matches afconvert convention)
     b5 = ((frame_length & 0x7) << 5) | ((buffer_fullness >> 6) & 0x1F)
 
     # Byte 6: buffer_fullness_lo(6) + num_raw_data_blocks(2)

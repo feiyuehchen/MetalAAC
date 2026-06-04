@@ -327,7 +327,9 @@ def quantize_batch_gpu(
     )
     smr_db = 10.0 * mx.log10(band_powers / masking_safe)
     smr_db = mx.where(mx.isnan(smr_db), mx.zeros_like(smr_db), smr_db)
-    scalefactors = mx.clip(60 - smr_db * 0.25, 0, 60).astype(mx.int32)
+    # Lower SF = finer quantization = more bits. Cap at 40 (was 60) so
+    # quiet bands still get some non-zero q values, using more of the bit budget.
+    scalefactors = mx.clip(40 - smr_db * 0.15, 0, 40).astype(mx.int32)
     mx.eval(scalefactors)
 
     # Step 2: vectorized binary search across ALL frames
