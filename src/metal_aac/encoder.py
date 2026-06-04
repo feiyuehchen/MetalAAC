@@ -317,14 +317,22 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
     with Timer() as t:
         if config.output_format == "adts":
             writer = ADTSWriter(config.sample_rate, 1)
-            # ISO path: sf are already ISO convention, use _iso encoder
-            for i in range(len(q)):
-                rdb = encode_raw_data_block_iso(
-                    q[i], sf[i], int(gg[i]),
-                    window_sequence=int(window_seqs[i]),
-                    sample_rate=config.sample_rate,
+            try:
+                from metal_aac.core.metal_bridge import MetalHuffman
+                metal = MetalHuffman.shared()
+                encoded_frames = metal.encode_adts_frames(
+                    q, sf, gg, window_seqs, config.sample_rate,
                 )
-                writer.write_frame(rdb)
+                for rdb in encoded_frames:
+                    writer.write_frame(rdb)
+            except (OSError, RuntimeError, FileNotFoundError):
+                for i in range(len(q)):
+                    rdb = encode_raw_data_block_iso(
+                        q[i], sf[i], int(gg[i]),
+                        window_sequence=int(window_seqs[i]),
+                        sample_rate=config.sample_rate,
+                    )
+                    writer.write_frame(rdb)
         else:
             try:
                 from metal_aac.core.metal_bridge import MetalHuffman
