@@ -38,7 +38,7 @@ from metal_aac.core.huffman import (
     encode_frames_parallel,
     encode_spectral_data,
 )
-from metal_aac.core.raw_data_block import encode_raw_data_block, encode_raw_data_block_iso
+from metal_aac.core.raw_data_block import encode_raw_data_block, encode_raw_data_block_iso, encode_cpe_iso
 from metal_aac.core.mdct import (
     MDCTBasis,
     MDCTBasisGPU,
@@ -112,14 +112,125 @@ def _encode_adts_frames(writer, q, sf, gg, window_seqs, config):
 def encode(pcm: np.ndarray, config: EncoderConfig | None = None) -> EncoderResult:
     """Encode PCM audio to AAC bitstream.
 
-    pcm: (num_samples,) float32, mono
+    pcm: (num_samples,) float32 mono, or (num_samples, 2) float32 stereo.
+    Stereo is encoded as a CPE (Channel Pair Element) with independent channels.
     """
     if config is None:
         config = EncoderConfig()
 
+    pcm = np.asarray(pcm, dtype=np.float32)
+    if pcm.ndim == 2 and pcm.shape[1] == 2:
+        return _encode_stereo(pcm, config)
+
+    if pcm.ndim == 2 and pcm.shape[1] == 1:
+        pcm = pcm[:, 0]
+
     if config.use_gpu and HAS_MLX:
         return _encode_gpu(pcm, config)
     return _encode_cpu(pcm, config)
+
+
+def _encode_stereo(pcm_stereo: np.ndarray, config: EncoderConfig) -> EncoderResult:
+    """Encode stereo PCM as ADTS with CPE (Channel Pair Element)."""
+    pcm_l = np.ascontiguousarray(pcm_stereo[:, 0])
+    pcm_r = np.ascontiguousarray(pcm_stereo[:, 1])
+    sr = config.sample_rate
+
+    half_config = EncoderConfig(
+        sample_rate=sr,
+        frame_size=config.frame_size,
+        hop_size=config.hop_size,
+        window_type=config.window_type,
+        target_bitrate_kbps=config.target_bitrate_kbps / 2,
+        use_gpu=config.use_gpu,
+        output_format="adts",
+        enable_window_switching=config.enable_window_switching,
+    )
+
+    window = get_window(config.window_type, config.frame_size)
+    window_mx = mx.array(window) if HAS_MLX else None
+    audio_duration = len(pcm_l) / sr
+    timings: dict[str, float] = {}
+
+    with Timer() as t:
+        if HAS_MLX:
+            frames_l = frame_signal_mlx(mx.array(pcm_l), config.frame_size, config.hop_size, window_mx)
+            frames_r = frame_signal_mlx(mx.array(pcm_r), config.frame_size, config.hop_size, window_mx)
+        else:
+            frames_l = mx.array(frame_signal(pcm_l, config.frame_size, config.hop_size, window))
+            frames_r = mx.array(frame_signal(pcm_r, config.frame_size, config.hop_size, window))
+    timings["framing"] = t.elapsed
+
+    num_frames = int(frames_l.shape[0])
+
+    with Timer() as t:
+        window_seqs = np.zeros(num_frames, dtype=np.int32)
+    timings["transient_detect"] = t.elapsed
+
+    with Timer() as t:
+        basis_gpu = MDCTBasisGPU(config.frame_size)
+        mdct_l = mdct_gpu(frames_l, basis_gpu)
+        mdct_r = mdct_gpu(frames_r, basis_gpu)
+        mx.eval(mdct_l, mdct_r)
+    timings["mdct"] = t.elapsed
+
+    with Timer() as t:
+        psy_cpu = PsychoacousticTables.create(sr, config.frame_size)
+        psy_gpu = PsychoacousticTablesGPU(psy_cpu)
+        mask_l = psychoacoustic_gpu(frames_l, psy_gpu)
+        mask_r = psychoacoustic_gpu(frames_r, psy_gpu)
+        mx.eval(mask_l, mask_r)
+    timings["psychoacoustic"] = t.elapsed
+
+    target = half_config.target_bits_per_frame
+    with Timer() as t:
+        qr_l = quantize_batch_gpu(mdct_l, mask_l, target, sr)
+        qr_r = quantize_batch_gpu(mdct_r, mask_r, target, sr)
+
+        # Adaptive calibration (same as mono path)
+        si = [0, max(1, num_frames//4), max(1, num_frames//2), min(num_frames-1, num_frames*3//4)]
+        si = [i for i in si if i < num_frames][:4]
+        est = sum(int(qr_l.total_bits[i]) + int(qr_r.total_bits[i]) for i in si)
+        act = 0
+        for i in si:
+            rdb = encode_cpe_iso(
+                qr_l.quantized[i], qr_l.scalefactors[i], int(qr_l.global_gain[i]),
+                qr_r.quantized[i], qr_r.scalefactors[i], int(qr_r.global_gain[i]),
+                sample_rate=sr,
+            )
+            act += len(rdb) * 8
+        if est > 0:
+            ratio = act / est
+            correction = min(1.0 / ratio, 1.15)
+            corrected = int(target * correction)
+            if corrected > target * 1.03:
+                qr_l = quantize_batch_gpu(mdct_l, mask_l, corrected, sr)
+                qr_r = quantize_batch_gpu(mdct_r, mask_r, corrected, sr)
+    timings["quantization"] = t.elapsed
+
+    with Timer() as t:
+        writer = ADTSWriter(sr, 2)
+        for i in range(num_frames):
+            rdb = encode_cpe_iso(
+                qr_l.quantized[i], qr_l.scalefactors[i], int(qr_l.global_gain[i]),
+                qr_r.quantized[i], qr_r.scalefactors[i], int(qr_r.global_gain[i]),
+                window_sequence=int(window_seqs[i]),
+                sample_rate=sr,
+            )
+            writer.write_frame(rdb)
+    timings["huffman_bitstream"] = t.elapsed
+
+    bitstream = writer.get_bytes()
+    actual_bitrate = writer.get_bitrate(audio_duration) if audio_duration > 0 else 0
+
+    return EncoderResult(
+        bitstream=bitstream,
+        num_frames=num_frames,
+        actual_bitrate_kbps=actual_bitrate,
+        audio_duration=audio_duration,
+        window_sequences=window_seqs,
+        timings=timings,
+    )
 
 
 def _encode_cpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:

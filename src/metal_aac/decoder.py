@@ -24,7 +24,7 @@ except ImportError:
 from metal_aac.core.adts import ADTSReader
 from metal_aac.core.bitstream import INDEX_TO_SAMPLE_RATE, BitstreamReader
 from metal_aac.core.huffman import decode_frames_metal, decode_spectral_data
-from metal_aac.core.raw_data_block import decode_raw_data_block_iso
+from metal_aac.core.raw_data_block import decode_raw_data_block_iso, decode_cpe_iso
 from metal_aac.core.mdct import (
     MDCTBasis,
     MDCTBasisGPU,
@@ -76,36 +76,74 @@ def _is_adts(data: bytes) -> bool:
     return len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xF0) == 0xF0
 
 
-def _parse_frames(bitstream: bytes) -> tuple[list[tuple], int, int, bool]:
+def _parse_frames(bitstream: bytes) -> tuple[list[tuple], int, int, bool, int]:
     """Parse bitstream (auto-detect ADTS vs legacy).
 
-    Returns: (frame_list, sample_rate, num_sfb, is_adts)
-    Each frame is (payload_bytes,).
+    Returns: (frame_list, sample_rate, num_sfb, is_adts, num_channels)
     """
     if _is_adts(bitstream):
         reader = ADTSReader(bitstream)
         raw_frames = reader.read_all_frames()
         if not raw_frames:
-            return [], 44100, 49, True
+            return [], 44100, 49, True, 1
         sr = raw_frames[0][0]["sample_rate"]
+        nch = raw_frames[0][0].get("channel_configuration", 1)
         from metal_aac.tables.scalefactor_bands import get_num_sfb
         num_sfb = get_num_sfb(sr)
-        return [(payload,) for _, payload in raw_frames], sr, num_sfb, True
+        return [(payload,) for _, payload in raw_frames], sr, num_sfb, True, nch
     else:
         reader = BitstreamReader(bitstream)
         raw_frames = reader.read_all_frames()
         if not raw_frames:
-            return [], 44100, 49, False
+            return [], 44100, 49, False, 1
         header = raw_frames[0][0]
         sr = INDEX_TO_SAMPLE_RATE.get(header.sample_rate_index, 44100)
-        return [(payload,) for _, payload in raw_frames], sr, header.num_sfb, False
+        return [(payload,) for _, payload in raw_frames], sr, header.num_sfb, False, 1
+
+
+def _decode_channel(
+    decoded_frames: list, num_sfb: int, config: DecoderConfig,
+    sample_rate: int, is_adts: bool, timings: dict | None = None,
+) -> np.ndarray:
+    """Dequantize + IMDCT + overlap-add for one channel."""
+    n_coeffs = config.frame_size // 2
+    num_frames = len(decoded_frames)
+    all_q = np.zeros((num_frames, n_coeffs), dtype=np.int32)
+    all_sf = np.zeros((num_frames, num_sfb), dtype=np.int32)
+    all_gain = np.zeros(num_frames, dtype=np.int32)
+    for i, (q, sf, g) in enumerate(decoded_frames):
+        all_q[i, :len(q)] = q[:n_coeffs]
+        all_sf[i, :len(sf)] = sf[:num_sfb]
+        all_gain[i] = g
+
+    with Timer() as t:
+        if is_adts:
+            mdct = dequantize_iso_cpu(all_q, all_sf, sample_rate)
+        else:
+            mdct = dequantize_cpu(all_q, all_sf, all_gain, sample_rate)
+    if timings is not None:
+        timings["dequantization"] = timings.get("dequantization", 0) + t.elapsed
+
+    with Timer() as t:
+        basis = MDCTBasis.create(config.frame_size)
+        time_frames = imdct_cpu(mdct, basis)
+    if timings is not None:
+        timings["imdct"] = timings.get("imdct", 0) + t.elapsed
+
+    with Timer() as t:
+        window = get_window(config.window_type, config.frame_size)
+        pcm = overlap_add(time_frames, config.hop_size, window, config.output_length)
+    if timings is not None:
+        timings["overlap_add"] = timings.get("overlap_add", 0) + t.elapsed
+
+    return pcm
 
 
 def _decode_cpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
     timings = {}
 
     with Timer() as t:
-        parsed_frames, sample_rate, num_sfb, is_adts = _parse_frames(bitstream)
+        parsed_frames, sample_rate, num_sfb, is_adts, num_channels = _parse_frames(bitstream)
 
         if not parsed_frames:
             return DecoderResult(
@@ -113,6 +151,23 @@ def _decode_cpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
                 sample_rate=44100,
                 num_frames=0,
                 timings=timings,
+            )
+
+        if is_adts and num_channels == 2:
+            frames_l, frames_r = [], []
+            for (payload,) in parsed_frames:
+                ch0, ch1 = decode_cpe_iso(payload, sample_rate)
+                frames_l.append(ch0)
+                frames_r.append(ch1)
+            timings["huffman_bitstream"] = t.elapsed
+
+            pcm_l = _decode_channel(frames_l, num_sfb, config, sample_rate, True, timings)
+            pcm_r = _decode_channel(frames_r, num_sfb, config, sample_rate, True, timings)
+            pcm = np.column_stack([pcm_l, pcm_r])
+
+            return DecoderResult(
+                pcm=pcm, sample_rate=sample_rate,
+                num_frames=len(parsed_frames), timings=timings,
             )
 
         decoded_frames = []
@@ -128,43 +183,12 @@ def _decode_cpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
             decoded_frames.append((quantized, scalefactors, global_gain))
     timings["huffman_bitstream"] = t.elapsed
 
-    num_frames = len(decoded_frames)
-    n_coeffs = config.frame_size // 2
-
-    with Timer() as t:
-        all_quantized = np.zeros((num_frames, n_coeffs), dtype=np.int32)
-        all_sf = np.zeros((num_frames, num_sfb), dtype=np.int32)
-        all_gain = np.zeros(num_frames, dtype=np.int32)
-
-        for i, (q, sf, g) in enumerate(decoded_frames):
-            all_quantized[i, : len(q)] = q[:n_coeffs]
-            all_sf[i, : len(sf)] = sf[:num_sfb]
-            all_gain[i] = g
-
-        if is_adts:
-            mdct_coeffs = dequantize_iso_cpu(all_quantized, all_sf, sample_rate)
-        else:
-            mdct_coeffs = dequantize_cpu(all_quantized, all_sf, all_gain, sample_rate)
-    timings["dequantization"] = t.elapsed
-
-    # IMDCT
-    with Timer() as t:
-        basis = MDCTBasis.create(config.frame_size)
-        time_frames = imdct_cpu(mdct_coeffs, basis)
-    timings["imdct"] = t.elapsed
-
-    # Window + overlap-add
-    with Timer() as t:
-        window = get_window(config.window_type, config.frame_size)
-        pcm = overlap_add(
-            time_frames, config.hop_size, window, config.output_length
-        )
-    timings["overlap_add"] = t.elapsed
+    pcm = _decode_channel(decoded_frames, num_sfb, config, sample_rate, is_adts, timings)
 
     return DecoderResult(
         pcm=pcm,
         sample_rate=sample_rate,
-        num_frames=num_frames,
+        num_frames=len(decoded_frames),
         timings=timings,
     )
 
@@ -173,7 +197,7 @@ def _decode_gpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
     timings = {}
 
     with Timer() as t:
-        parsed_frames, sample_rate, num_sfb, is_adts = _parse_frames(bitstream)
+        parsed_frames, sample_rate, num_sfb, is_adts, num_channels = _parse_frames(bitstream)
 
         if not parsed_frames:
             return DecoderResult(
@@ -184,6 +208,19 @@ def _decode_gpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
             )
 
         n_coeffs = config.frame_size // 2
+
+        if is_adts and num_channels == 2:
+            frames_l, frames_r = [], []
+            for (payload,) in parsed_frames:
+                ch0, ch1 = decode_cpe_iso(payload, sample_rate)
+                frames_l.append(ch0)
+                frames_r.append(ch1)
+            timings["huffman_bitstream"] = t.elapsed
+            pcm_l = _decode_channel(frames_l, num_sfb, config, sample_rate, True, timings)
+            pcm_r = _decode_channel(frames_r, num_sfb, config, sample_rate, True, timings)
+            pcm = np.column_stack([pcm_l, pcm_r])
+            return DecoderResult(pcm=pcm, sample_rate=sample_rate,
+                                num_frames=len(parsed_frames), timings=timings)
 
         if is_adts:
             decoded_frames = []

@@ -268,6 +268,118 @@ def encode_raw_data_block_iso(
     return bw.flush()
 
 
+def _write_ics(
+    bw: BitWriter,
+    quantized: np.ndarray,
+    iso_scalefactors: np.ndarray,
+    iso_global_gain: int,
+    sections: list,
+    sfb_offsets: list[int],
+    num_sfb: int,
+) -> None:
+    """Write an individual_channel_stream (no ics_info — caller writes it)."""
+    bw.write(iso_global_gain & 0xFF, 8)
+
+    if sections[0][2] == 2:  # short window
+        sect_esc_val, sect_bits = 7, 3
+    else:
+        sect_esc_val, sect_bits = 31, 5
+
+    for start_sfb, end_sfb, cb in sections:
+        sect_len = end_sfb - start_sfb
+        bw.write(cb & 0xF, 4)
+        while sect_len >= sect_esc_val:
+            bw.write(sect_esc_val, sect_bits)
+            sect_len -= sect_esc_val
+        bw.write(sect_len, sect_bits)
+
+    prev_sf = iso_global_gain
+    for sb in range(num_sfb):
+        cb = ZERO_HCB
+        for s_start, s_end, s_cb in sections:
+            if s_start <= sb < s_end:
+                cb = s_cb
+                break
+        if cb == ZERO_HCB:
+            continue
+        diff = int(iso_scalefactors[sb]) - prev_sf
+        diff = max(-60, min(60, diff))
+        if diff in SF_CODES:
+            cw, cl = SF_CODES[diff]
+            bw.write(cw, cl)
+        else:
+            bw.write(0, 1)
+        prev_sf += diff
+
+    bw.write(0, 1)  # pulse
+    bw.write(0, 1)  # tns
+    bw.write(0, 1)  # gain control
+
+    quantized = np.clip(quantized, -255, 255)
+    q_list = quantized.tolist() if hasattr(quantized, 'tolist') else list(quantized)
+    n_coeffs = len(q_list)
+    for start_sfb, end_sfb, cb in sections:
+        if cb == ZERO_HCB:
+            continue
+        codebook = CODEBOOKS.get(cb)
+        if codebook is None:
+            continue
+        lo = sfb_offsets[start_sfb]
+        hi = min(sfb_offsets[end_sfb], n_coeffs)
+        if codebook.dimension == 4:
+            for i in range(lo, hi, 4):
+                v0 = q_list[i] if i < n_coeffs else 0
+                v1 = q_list[i+1] if i+1 < n_coeffs else 0
+                v2 = q_list[i+2] if i+2 < n_coeffs else 0
+                v3 = q_list[i+3] if i+3 < n_coeffs else 0
+                _encode_spectral_quad(bw, cb, v0, v1, v2, v3)
+        else:
+            for i in range(lo, hi, 2):
+                v0 = q_list[i] if i < n_coeffs else 0
+                v1 = q_list[i+1] if i+1 < n_coeffs else 0
+                _encode_spectral_pair(bw, cb, v0, v1)
+
+
+def encode_cpe_iso(
+    q_l: np.ndarray, sf_l: np.ndarray, gg_l: int,
+    q_r: np.ndarray, sf_r: np.ndarray, gg_r: int,
+    window_sequence: int = 0,
+    sample_rate: int = 44100,
+) -> bytes:
+    """Encode a stereo frame as a Channel Pair Element (CPE)."""
+    sfb_offsets = get_sfb_offsets(sample_rate)
+    num_sfb = len(sfb_offsets) - 1
+
+    sections_l = _compute_sections(np.clip(q_l, -255, 255), sfb_offsets)
+    sections_r = _compute_sections(np.clip(q_r, -255, 255), sfb_offsets)
+
+    bw = BitWriter()
+    bw.write(1, 3)   # ID_CPE
+    bw.write(0, 4)   # element_instance_tag
+    bw.write(1, 1)   # common_window
+
+    # shared ics_info
+    bw.write(0, 1)   # reserved
+    bw.write(window_sequence & 0x3, 2)
+    bw.write(1, 1)   # KBD
+    if window_sequence == 2:
+        bw.write(num_sfb & 0xF, 4)
+        bw.write(0x7F, 7)
+        sect_esc_val, sect_bits = 7, 3
+    else:
+        bw.write(num_sfb & 0x3F, 6)
+        bw.write(0, 1)  # predictor = 0
+        sect_esc_val, sect_bits = 31, 5
+
+    bw.write(0, 2)   # ms_mask_present = 0 (no M/S)
+
+    _write_ics(bw, q_l, sf_l, gg_l, sections_l, sfb_offsets, num_sfb)
+    _write_ics(bw, q_r, sf_r, gg_r, sections_r, sfb_offsets, num_sfb)
+
+    bw.write(7, 3)  # ID_END
+    return bw.flush()
+
+
 def encode_raw_data_block(
     quantized: np.ndarray,
     scalefactors: np.ndarray,
@@ -505,42 +617,13 @@ def _read_escape(br: BitReader) -> int:
     return (1 << (count + 4)) | br.read(count + 4)
 
 
-def decode_raw_data_block_iso(
-    data: bytes,
-    sample_rate: int = 44100,
-) -> tuple[np.ndarray, np.ndarray, int]:
-    """Decode one ISO raw_data_block (SCE) from bytes.
-
-    Returns (quantized, scalefactors, global_gain):
-      quantized: (N,) int32
-      scalefactors: (num_sfb,) int32
-      global_gain: int
-    """
-    sfb_offsets = get_sfb_offsets(sample_rate)
+def _read_ics_body(
+    br: BitReader, sfb_offsets: list[int], num_sfb: int,
+    sect_esc_val: int, sect_bits: int, global_gain: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read section_data + scale_factor_data + spectral_data of an ICS."""
     num_sfb_max = len(sfb_offsets) - 1
-    br = BitReader(data)
 
-    element_id = br.read(3)
-    _instance_tag = br.read(4)
-    global_gain = br.read(8)
-
-    # ics_info
-    _reserved = br.read(1)
-    window_sequence = br.read(2)
-    _window_shape = br.read(1)
-
-    if window_sequence == 2:
-        max_sfb = br.read(4)
-        _grouping = br.read(7)
-        sect_esc_val, sect_bits = 7, 3
-    else:
-        max_sfb = br.read(6)
-        _predictor = br.read(1)
-        sect_esc_val, sect_bits = 31, 5
-
-    num_sfb = min(max_sfb, num_sfb_max)
-
-    # section_data
     sections = []
     k = 0
     while k < num_sfb:
@@ -555,7 +638,6 @@ def decode_raw_data_block_iso(
         sections.append((k, end, cb))
         k = end
 
-    # scale_factor_data
     scalefactors = np.zeros(num_sfb_max, dtype=np.int32)
     sf_tree = _get_sf_tree()
     prev_sf = global_gain
@@ -576,12 +658,8 @@ def decode_raw_data_block_iso(
         prev_sf += diff
         scalefactors[sb] = prev_sf
 
-    # pulse_data / tns_data / gain_control_data
-    _pulse = br.read(1)
-    _tns = br.read(1)
-    _gain = br.read(1)
+    br.read(1); br.read(1); br.read(1)
 
-    # spectral_data
     n_coeffs = sfb_offsets[-1] if sfb_offsets else 1024
     quantized = np.zeros(n_coeffs, dtype=np.int32)
 
@@ -625,4 +703,67 @@ def decode_raw_data_block_iso(
                     if i + k < n_coeffs:
                         quantized[i + k] = vals[k]
 
+    return quantized, scalefactors
+
+
+def _read_ics_info(br: BitReader, num_sfb_max: int) -> tuple[int, int, int]:
+    """Read ics_info. Returns (num_sfb, sect_esc_val, sect_bits)."""
+    _reserved = br.read(1)
+    window_sequence = br.read(2)
+    _shape = br.read(1)
+    if window_sequence == 2:
+        num_sfb = min(br.read(4), num_sfb_max)
+        _grouping = br.read(7)
+        return num_sfb, 7, 3
+    else:
+        num_sfb = min(br.read(6), num_sfb_max)
+        _predictor = br.read(1)
+        return num_sfb, 31, 5
+
+
+def decode_raw_data_block_iso(
+    data: bytes,
+    sample_rate: int = 44100,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Decode one ISO raw_data_block (SCE or CPE ch0) from bytes."""
+    sfb_offsets = get_sfb_offsets(sample_rate)
+    num_sfb_max = len(sfb_offsets) - 1
+    br = BitReader(data)
+
+    element_id = br.read(3)
+    _tag = br.read(4)
+
+    if element_id == 1:
+        return decode_cpe_iso(data, sample_rate)[0]
+
+    # SCE: global_gain + ics_info + ICS body
+    global_gain = br.read(8)
+    num_sfb, sect_esc_val, sect_bits = _read_ics_info(br, num_sfb_max)
+    quantized, scalefactors = _read_ics_body(
+        br, sfb_offsets, num_sfb, sect_esc_val, sect_bits, global_gain
+    )
     return quantized, scalefactors, global_gain
+
+
+def decode_cpe_iso(
+    data: bytes,
+    sample_rate: int = 44100,
+) -> tuple[tuple[np.ndarray, np.ndarray, int], tuple[np.ndarray, np.ndarray, int]]:
+    """Decode a Channel Pair Element. Returns ((q_l, sf_l, gg_l), (q_r, sf_r, gg_r))."""
+    sfb_offsets = get_sfb_offsets(sample_rate)
+    num_sfb_max = len(sfb_offsets) - 1
+    br = BitReader(data)
+
+    _element_id = br.read(3)
+    _tag = br.read(4)
+    common_window = br.read(1)
+
+    if common_window:
+        num_sfb, sect_esc_val, sect_bits = _read_ics_info(br, num_sfb_max)
+        _ms_mask = br.read(2)
+
+    gg0 = br.read(8)
+    q0, sf0 = _read_ics_body(br, sfb_offsets, num_sfb, sect_esc_val, sect_bits, gg0)
+    gg1 = br.read(8)
+    q1, sf1 = _read_ics_body(br, sfb_offsets, num_sfb, sect_esc_val, sect_bits, gg1)
+    return (q0, sf0, gg0), (q1, sf1, gg1)
