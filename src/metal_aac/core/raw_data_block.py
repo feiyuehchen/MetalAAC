@@ -186,6 +186,11 @@ def encode_raw_data_block(
     """
     sfb_offsets = get_sfb_offsets(sample_rate)
     num_sfb = len(sfb_offsets) - 1
+
+    # Clamp quantized values to avoid ESC overflow in decoders.
+    # Max safe escape: count=4 → value < 2^8 = 256.
+    quantized = np.clip(quantized, -255, 255)
+
     bw = BitWriter()
 
     # ID_SCE (3 bits) + element_instance_tag (4 bits)
