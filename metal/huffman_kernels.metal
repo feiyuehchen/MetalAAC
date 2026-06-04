@@ -573,10 +573,18 @@ kernel void kernel_encode_raw_data_block(
         write_bits_seq(raw, bp, 0, 1); bp += 1;  // reserved
         write_bits_seq(raw, bp, (uint)wseq & 3, 2); bp += 2;
         write_bits_seq(raw, bp, 1, 1); bp += 1;  // KBD
-        write_bits_seq(raw, bp, (uint)num_sfb & 0x3F, 6); bp += 6;
-        write_bits_seq(raw, bp, 0, 1); bp += 1;  // predictor=0
+        if (wseq == 2) {
+            // EIGHT_SHORT_SEQUENCE: 4-bit max_sfb + 7-bit grouping
+            write_bits_seq(raw, bp, (uint)num_sfb & 0xF, 4); bp += 4;
+            write_bits_seq(raw, bp, 0x7F, 7); bp += 7;  // all in one group
+        } else {
+            write_bits_seq(raw, bp, (uint)num_sfb & 0x3F, 6); bp += 6;
+            write_bits_seq(raw, bp, 0, 1); bp += 1;  // predictor=0
+        }
 
-        // section_data
+        // section_data (short windows use 3-bit lengths, long use 5-bit)
+        int sect_esc = (wseq == 2) ? 7 : 31;
+        int sect_nbits = (wseq == 2) ? 3 : 5;
         int k = 0;
         while (k < num_sfb) {
             int cb = sfb_cb[k];
@@ -585,11 +593,11 @@ kernel void kernel_encode_raw_data_block(
             int sect_len = j - k;
 
             write_bits_seq(raw, bp, (uint)cb & 0xF, 4); bp += 4;
-            while (sect_len >= 31) {
-                write_bits_seq(raw, bp, 31, 5); bp += 5;
-                sect_len -= 31;
+            while (sect_len >= sect_esc) {
+                write_bits_seq(raw, bp, sect_esc, sect_nbits); bp += sect_nbits;
+                sect_len -= sect_esc;
             }
-            write_bits_seq(raw, bp, (uint)sect_len, 5); bp += 5;
+            write_bits_seq(raw, bp, (uint)sect_len, sect_nbits); bp += sect_nbits;
             k = j;
         }
 
