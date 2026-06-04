@@ -145,24 +145,20 @@ class MetalHuffman:
             offset += n_entries
 
         # Rebuild with actual codes from the codebook's raw arrays
-        import struct
+        # HuffEntry: uint32 code (4) + uint8 bits (1) + pad[3] (3) = 8 bytes
+        import struct as st
         lut_data = bytearray()
+        from metal_aac.tables import huffman_tables as ht
         for cb_idx in range(1, 12):
-            cb = CODEBOOKS[cb_idx]
-            codes_list = list(cb.codes.values()) if hasattr(cb, '_raw_codes') else None
-            # Use the raw arrays directly
-            from metal_aac.tables import huffman_tables as ht
             codes_arr = getattr(ht, f'CB{cb_idx}_CODES')
             bits_arr = getattr(ht, f'CB{cb_idx}_LENGTHS')
             for i in range(len(codes_arr)):
-                lut_data += struct.pack('<HBB', codes_arr[i] & 0xFFFF, bits_arr[i], 0)
+                lut_data += st.pack('<IB3x', codes_arr[i], bits_arr[i])
 
-        # SF LUT
+        # SF LUT (121 entries, 8 bytes each)
         sf_lut_data = bytearray()
         for i in range(121):
-            code = SF_CODE_VALUES[i]
-            bits = SF_CODE_LENGTHS[i]
-            sf_lut_data += struct.pack('<HBB', code & 0xFFFF, bits, 0)
+            sf_lut_data += st.pack('<IB3x', SF_CODE_VALUES[i], SF_CODE_LENGTHS[i])
 
         # Recompute cb_offsets based on actual sizes
         cb_offsets_arr = [0] * 12

@@ -454,9 +454,9 @@ kernel void kernel_decode_frames(
 // ============================================================
 
 struct HuffEntry {
-    uint16_t code;
+    uint32_t code;
     uint8_t  bits;
-    uint8_t  pad;
+    uint8_t  pad[3];
 };
 
 // Helper: write `len` bits of `cw` at `bit_pos` into atomic uint32 buffer
@@ -753,13 +753,11 @@ kernel void kernel_encode_raw_data_block(
                     write_bits_seq(raw, bp, e.code, e.bits); bp += e.bits;
 
                     if (!is_signed) {
-                        int abs0 = (v0 >= 0) ? v0 : -v0;
-                        int abs1 = (v1 >= 0) ? v1 : -v1;
-                        int clamp = (cb == 11) ? 16 : mabs;
-                        if (abs0 > 0 && abs0 <= clamp) {
+                        // Sign bits: written for any non-zero value (using clamped abs)
+                        if (a0 > 0) {
                             write_bits_seq(raw, bp, (v0 < 0) ? 1 : 0, 1); bp += 1;
                         }
-                        if (abs1 > 0 && abs1 <= clamp) {
+                        if (a1 > 0) {
                             write_bits_seq(raw, bp, (v1 < 0) ? 1 : 0, 1); bp += 1;
                         }
 
