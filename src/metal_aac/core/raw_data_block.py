@@ -1,6 +1,6 @@
-"""ISO/IEC 14496-3 raw_data_block writer for AAC-LC.
+"""ISO/IEC 14496-3 raw_data_block reader/writer for AAC-LC.
 
-Writes a single_channel_element (SCE) containing:
+Encodes and decodes single_channel_element (SCE) containing:
   - element_instance_tag (4 bits)
   - individual_channel_stream:
       - global_gain (8 bits)
@@ -8,9 +8,6 @@ Writes a single_channel_element (SCE) containing:
       - section_data: codebook index + section length per section
       - scale_factor_data: DPCM scalefactors with SF Huffman codebook
       - spectral_data: quantized MDCT coefficients with spectral codebooks
-
-This replaces the legacy exp-Golomb encoding. The output of
-encode_raw_data_block() is the payload passed to ADTSWriter.write_frame().
 """
 
 from __future__ import annotations
@@ -21,6 +18,8 @@ from metal_aac.tables.huffman_tables import (
     CODEBOOKS,
     ESC_HCB,
     SF_CODES,
+    SF_CODE_LENGTHS,
+    SF_CODE_VALUES,
     ZERO_HCB,
     select_codebook,
 )
@@ -403,3 +402,227 @@ def encode_raw_data_block(
     bw.write(7, 3)  # ID_END = 7
 
     return bw.flush()
+
+
+# ---- Decoder ----
+
+
+class BitReader:
+    __slots__ = ('_data', '_pos', '_nbits')
+
+    def __init__(self, data: bytes):
+        self._data = data
+        self._pos = 0
+        self._nbits = len(data) * 8
+
+    def read(self, n: int) -> int:
+        result = 0
+        for _ in range(n):
+            if self._pos >= self._nbits:
+                return result
+            byte_idx = self._pos >> 3
+            bit_idx = 7 - (self._pos & 7)
+            result = (result << 1) | ((self._data[byte_idx] >> bit_idx) & 1)
+            self._pos += 1
+        return result
+
+    def read1(self) -> int:
+        if self._pos >= self._nbits:
+            return 0
+        byte_idx = self._pos >> 3
+        bit_idx = 7 - (self._pos & 7)
+        self._pos += 1
+        return (self._data[byte_idx] >> bit_idx) & 1
+
+    @property
+    def remaining(self) -> int:
+        return self._nbits - self._pos
+
+
+def _build_huff_tree(codes: list[int], lengths: list[int]) -> list:
+    """Build a binary tree for Huffman decoding. [left, right, value]."""
+    root = [None, None, None]
+    for i, (code, length) in enumerate(zip(codes, lengths)):
+        if length == 0:
+            continue
+        node = root
+        for bit in range(length - 1, -1, -1):
+            b = (code >> bit) & 1
+            if node[b] is None:
+                node[b] = [None, None, None]
+            node = node[b]
+        node[2] = i
+    return root
+
+
+def _huff_decode(br: BitReader, tree: list) -> int | None:
+    node = tree
+    while node[2] is None:
+        if br.remaining <= 0:
+            return None
+        b = br.read1()
+        node = node[b]
+        if node is None:
+            return None
+    return node[2]
+
+
+_DECODE_TREES: dict[int, list] = {}
+_SF_DECODE_TREE: list | None = None
+
+
+def _get_spectral_tree(cb_idx: int) -> list:
+    if cb_idx not in _DECODE_TREES:
+        from metal_aac.tables import huffman_tables as ht
+        codes = getattr(ht, f'CB{cb_idx}_CODES')
+        lengths = getattr(ht, f'CB{cb_idx}_LENGTHS')
+        _DECODE_TREES[cb_idx] = _build_huff_tree(codes, lengths)
+    return _DECODE_TREES[cb_idx]
+
+
+def _get_sf_tree() -> list:
+    global _SF_DECODE_TREE
+    if _SF_DECODE_TREE is None:
+        _SF_DECODE_TREE = _build_huff_tree(SF_CODE_VALUES, SF_CODE_LENGTHS)
+    return _SF_DECODE_TREE
+
+
+def _index_to_values(idx: int, dim: int, signed: bool, max_abs: int) -> tuple:
+    dim_size = (2 * max_abs + 1) if signed else (max_abs + 1)
+    offset = max_abs if signed else 0
+    vals = []
+    for _ in range(dim):
+        vals.append(idx % dim_size - offset)
+        idx //= dim_size
+    vals.reverse()
+    return tuple(vals)
+
+
+def _read_escape(br: BitReader) -> int:
+    count = 0
+    while br.read1() == 1:
+        count += 1
+    return (1 << (count + 4)) | br.read(count + 4)
+
+
+def decode_raw_data_block_iso(
+    data: bytes,
+    sample_rate: int = 44100,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Decode one ISO raw_data_block (SCE) from bytes.
+
+    Returns (quantized, scalefactors, global_gain):
+      quantized: (N,) int32
+      scalefactors: (num_sfb,) int32
+      global_gain: int
+    """
+    sfb_offsets = get_sfb_offsets(sample_rate)
+    num_sfb_max = len(sfb_offsets) - 1
+    br = BitReader(data)
+
+    element_id = br.read(3)
+    _instance_tag = br.read(4)
+    global_gain = br.read(8)
+
+    # ics_info
+    _reserved = br.read(1)
+    window_sequence = br.read(2)
+    _window_shape = br.read(1)
+
+    if window_sequence == 2:
+        max_sfb = br.read(4)
+        _grouping = br.read(7)
+        sect_esc_val, sect_bits = 7, 3
+    else:
+        max_sfb = br.read(6)
+        _predictor = br.read(1)
+        sect_esc_val, sect_bits = 31, 5
+
+    num_sfb = min(max_sfb, num_sfb_max)
+
+    # section_data
+    sections = []
+    k = 0
+    while k < num_sfb:
+        cb = br.read(4)
+        sect_len = 0
+        while True:
+            inc = br.read(sect_bits)
+            sect_len += inc
+            if inc < sect_esc_val:
+                break
+        end = min(k + sect_len, num_sfb)
+        sections.append((k, end, cb))
+        k = end
+
+    # scale_factor_data
+    scalefactors = np.zeros(num_sfb_max, dtype=np.int32)
+    sf_tree = _get_sf_tree()
+    prev_sf = global_gain
+    for sb in range(num_sfb):
+        cb = ZERO_HCB
+        for s_start, s_end, s_cb in sections:
+            if s_start <= sb < s_end:
+                cb = s_cb
+                break
+        if cb == ZERO_HCB:
+            scalefactors[sb] = prev_sf
+            continue
+        idx = _huff_decode(br, sf_tree)
+        if idx is None:
+            scalefactors[sb] = prev_sf
+            continue
+        diff = idx - 60
+        prev_sf += diff
+        scalefactors[sb] = prev_sf
+
+    # pulse_data / tns_data / gain_control_data
+    _pulse = br.read(1)
+    _tns = br.read(1)
+    _gain = br.read(1)
+
+    # spectral_data
+    n_coeffs = sfb_offsets[-1] if sfb_offsets else 1024
+    quantized = np.zeros(n_coeffs, dtype=np.int32)
+
+    for start_sfb, end_sfb, cb in sections:
+        if cb == ZERO_HCB or cb not in CODEBOOKS:
+            continue
+        codebook = CODEBOOKS[cb]
+        tree = _get_spectral_tree(cb)
+        lo = sfb_offsets[start_sfb]
+        hi = min(sfb_offsets[end_sfb], n_coeffs)
+
+        if codebook.dimension == 4:
+            for i in range(lo, hi, 4):
+                idx = _huff_decode(br, tree)
+                if idx is None:
+                    break
+                vals = list(_index_to_values(idx, 4, codebook.signed, codebook.max_abs))
+                if not codebook.signed:
+                    for k in range(4):
+                        if vals[k] > 0 and br.read1():
+                            vals[k] = -vals[k]
+                for k in range(4):
+                    if i + k < n_coeffs:
+                        quantized[i + k] = vals[k]
+        else:
+            for i in range(lo, hi, 2):
+                idx = _huff_decode(br, tree)
+                if idx is None:
+                    break
+                vals = list(_index_to_values(idx, 2, codebook.signed, codebook.max_abs))
+                if not codebook.signed:
+                    for k in range(2):
+                        if vals[k] > 0 and br.read1():
+                            vals[k] = -vals[k]
+                    if cb == ESC_HCB:
+                        for k in range(2):
+                            if abs(vals[k]) >= 16:
+                                sign = -1 if vals[k] < 0 else 1
+                                vals[k] = sign * _read_escape(br)
+                for k in range(2):
+                    if i + k < n_coeffs:
+                        quantized[i + k] = vals[k]
+
+    return quantized, scalefactors, global_gain

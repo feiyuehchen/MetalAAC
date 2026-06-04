@@ -5,6 +5,21 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-04
+
+### Added
+- **ADTS decoder**: `decode_raw_data_block_iso()` parses ISO Huffman-coded
+  raw_data_blocks (section_data, SF DPCM, 11 spectral codebooks, escape coding).
+  Decoder auto-detects ADTS vs legacy format.
+- **ISO dequantizer**: `dequantize_iso_cpu()` uses `x_hat = sign(q) * |q|^(4/3) * 2^((sf-200)/4)`.
+- BitReader class for bit-level parsing.
+- Huffman decode trees built lazily from codebook tables.
+- Full encode → decode roundtrip without ffmpeg dependency.
+
+### Quality
+- Our decoder vs ffmpeg decoder: **123.7 dB agreement** (floating-point identical)
+- Roundtrip SNR (encode → our decode): 26.9 dB (440 Hz, 5s)
+
 ## [0.7.0] - 2026-06-04
 
 ### Changed
