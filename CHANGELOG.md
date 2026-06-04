@@ -5,6 +5,22 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-04
+
+### Added
+- **Stereo encoding**: accepts `(N, 2)` float32 stereo input. Each channel is
+  independently MDCT'd, quantized, and encoded into a CPE (Channel Pair Element)
+  with common_window and shared ics_info. No M/S coding yet (dual-independent).
+- **Stereo decoding**: auto-detects CPE (channel_config=2) in ADTS, decodes two
+  channels to `(N, 2)` stereo output.
+- `encode_cpe_iso()` / `decode_cpe_iso()` for CPE bitstream format.
+- `_write_ics()` / `_read_ics_body()` refactored as shared helpers for SCE and CPE.
+- Adaptive bitrate calibration applied to stereo path.
+
+### Quality (stereo, 128 kbps target)
+- 440 Hz L + 880 Hz R: **132 kbps**, ffmpeg SNR **51.7 / 51.2 dB**
+- ffmpeg correctly decodes stereo output
+
 ## [0.8.1] - 2026-06-04
 
 ### Fixed
