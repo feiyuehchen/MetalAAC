@@ -167,7 +167,7 @@ def _write_escape(bw: BitWriter, value: int) -> None:
     """
     n = value
     count = 0
-    while n >= (1 << (count + 4)):
+    while n >= (1 << (count + 5)):
         count += 1
     for _ in range(count):
         bw.write(1, 1)
@@ -196,13 +196,12 @@ def encode_raw_data_block(
 
     quantized = np.clip(quantized, -255, 255)
 
-    # Compute ISO scalefactors and derive the correct global_gain for the header.
-    # ffmpeg decoder: scale = 2^((sf - POW_SF2_ZERO) / 4) where POW_SF2_ZERO=200
-    # Our quantizer: q = |x|^(3/4) * 2^((gg - internal_sf*4)/16)
-    # For round-trip: iso_sf = 157 - (gg - internal_sf*4) / 3
-    # (157 = 200 - 4*log2(MDCT_norm_ratio), compensating for unnormalized MDCT)
+    # Compute ISO scalefactors for the bitstream header.
+    # ffmpeg decoder: scale = 2^((sf - 200) / 4)
+    # Our quantizer: q = |x|^(3/4) * 2^((gg - sf_int*4)/16)
+    # MDCT is now normalized (2/N), so iso_sf = 200 - (gg - sf_int*4) / 3
     sections = _compute_sections(quantized, sfb_offsets)
-    iso_sfs = [max(0, min(255, int(round(157 - (global_gain - int(scalefactors[sb])*4) / 3.0)))) for sb in range(num_sfb)]
+    iso_sfs = [max(0, min(255, int(round(200 - (global_gain - int(scalefactors[sb])*4) / 3.0)))) for sb in range(num_sfb)]
     non_zero_sfs = [iso_sfs[sb] for sb in range(num_sfb)
                     if any(s <= sb < e and cb != ZERO_HCB for s, e, cb in sections)]
     iso_global_gain = int(np.mean(non_zero_sfs)) if non_zero_sfs else 100

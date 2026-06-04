@@ -553,7 +553,7 @@ kernel void kernel_encode_raw_data_block(
             int sf_int = scalefactors[b * num_sfb + sb];
             // Round to nearest (match Python's round()) instead of truncating
             int num = gg - sf_int * 4;
-            int isf = 157 - (num >= 0 ? (num + 1) / 3 : (num - 1) / 3);
+            int isf = 200 - (num >= 0 ? (num + 1) / 3 : (num - 1) / 3);
             if (isf < 0) isf = 0;
             if (isf > 255) isf = 255;
             iso_sf_arr[sb] = isf;
@@ -704,7 +704,7 @@ kernel void kernel_encode_raw_data_block(
                             if (orig0 >= 16) {
                                 int n = orig0;
                                 int count = 0;
-                                while (n >= (1 << (count + 4))) count++;
+                                while (n >= (1 << (count + 5))) count++;
                                 for (int c = 0; c < count; c++) {
                                     write_bits_seq(raw, bp, 1, 1); bp += 1;
                                 }
@@ -714,7 +714,7 @@ kernel void kernel_encode_raw_data_block(
                             if (orig1 >= 16) {
                                 int n = orig1;
                                 int count = 0;
-                                while (n >= (1 << (count + 4))) count++;
+                                while (n >= (1 << (count + 5))) count++;
                                 for (int c = 0; c < count; c++) {
                                     write_bits_seq(raw, bp, 1, 1); bp += 1;
                                 }

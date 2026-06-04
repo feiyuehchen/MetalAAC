@@ -41,10 +41,14 @@ class MDCTBasis:
         n = two_n // 2
         ns = np.arange(two_n, dtype=np.float64)
         ks = np.arange(n, dtype=np.float64)
-        basis = np.cos(
+        raw_basis = np.cos(
             np.pi / n * np.outer(ns + 0.5 + n / 2, ks + 0.5)
-        ).astype(np.float32)
-        inv_basis = (basis * (2.0 / n)).T.astype(np.float32)
+        )
+        # Include 2/N normalization in forward MDCT so coefficients
+        # are in PCM scale (matches ISO convention for ffmpeg decode).
+        basis = (raw_basis * (2.0 / n)).astype(np.float32)
+        # Inverse has no extra factor since forward already normalized.
+        inv_basis = raw_basis.T.astype(np.float32)
         return MDCTBasis(forward=basis, inverse=inv_basis, n=n)
 
 
