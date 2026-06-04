@@ -350,9 +350,11 @@ def quantize_batch_gpu(
         )
         q = mx.sign(mdct_coeffs) * mx.floor(powered * gain_factor + 0.4054)
 
-        bits = _gpu_estimate_bits(q.astype(mx.int32))
+        q_int = q.astype(mx.int32)
+        bits = _gpu_estimate_bits(q_int)
+        max_abs = mx.max(mx.abs(q_int), axis=-1)
 
-        fits = bits <= target
+        fits = (bits <= target) & (max_abs <= 255)
         best_gains = mx.where(fits, gains, best_gains)
         best_bits = mx.where(fits, bits, best_bits)
         gain_lo = mx.where(fits, gains + 1, gain_lo)

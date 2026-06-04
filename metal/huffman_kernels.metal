@@ -22,15 +22,14 @@ kernel void kernel_quantize(
     uint tid [[thread_index_in_threadgroup]],
     uint gid [[threadgroup_position_in_grid]])
 {
-    // Shared state for binary search (only thread 0 writes)
     threadgroup int gain_lo;
     threadgroup int gain_hi;
     threadgroup int best_gain;
     threadgroup int best_bits;
     threadgroup int current_gain;
 
-    // Shared memory for parallel reduction of bit counts
     threadgroup uint bit_sums[1024];
+    threadgroup uint max_abs_q[1024];  // for max-abs reduction
 
     uint b = gid;
     uint idx = b * (uint)N + tid;
@@ -80,20 +79,25 @@ kernel void kernel_quantize(
         uint bits = 2u * m + 1u;
 
         bit_sums[tid] = (tid < (uint)N) ? bits : 0u;
+        max_abs_q[tid] = (tid < (uint)N) ? (uint)abs_q : 0u;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Parallel reduction (tree sum, 10 steps for 1024 elements)
+        // Parallel reduction: sum bits AND max abs_q
         for (uint s = 512u; s > 0u; s >>= 1u) {
             if (tid < s) {
                 bit_sums[tid] += bit_sums[tid + s];
+                max_abs_q[tid] = max(max_abs_q[tid], max_abs_q[tid + s]);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
         // Thread 0 updates search bounds
+        // Reject gain if bits exceed budget OR max |q| > 255 (ISO ESC limit)
         if (tid == 0u) {
             int total = (int)bit_sums[0];
-            if (total <= target_bits) {
+            int max_val = (int)max_abs_q[0];
+            bool fits = (total <= target_bits) && (max_val <= 255);
+            if (fits) {
                 best_gain = gain;
                 best_bits = total;
                 gain_lo = gain + 1;
@@ -516,19 +520,8 @@ kernel void kernel_encode_raw_data_block(
         threadgroup uint32_t* raw = (threadgroup uint32_t*)shared_words;
         uint bp = 0;
 
-        // ID_SCE(3) + tag(4) + global_gain(8)
-        write_bits_seq(raw, bp, 0, 3); bp += 3;
-        write_bits_seq(raw, bp, 0, 4); bp += 4;
-        write_bits_seq(raw, bp, (uint)gg & 0xFF, 8); bp += 8;
-
-        // ics_info
-        write_bits_seq(raw, bp, 0, 1); bp += 1;  // reserved
-        write_bits_seq(raw, bp, (uint)wseq & 3, 2); bp += 2;
-        write_bits_seq(raw, bp, 1, 1); bp += 1;  // KBD
-        write_bits_seq(raw, bp, (uint)num_sfb & 0x3F, 6); bp += 6;  // max_sfb
-        write_bits_seq(raw, bp, 0, 1); bp += 1;  // predictor=0
-
-        // Compute per-SFB codebook from max abs value
+        // Compute per-SFB codebook and ISO scalefactors BEFORE writing header
+        // (need ISO global_gain for the header)
         for (int sb = 0; sb < num_sfb; sb++) {
             int lo = sfb_offsets_buf[sb];
             int hi = sfb_offsets_buf[sb + 1];
@@ -552,7 +545,36 @@ kernel void kernel_encode_raw_data_block(
             sfb_cb[sb] = cb;
         }
 
-        // section_data: merge adjacent SFBs with same codebook
+        // Compute ISO scalefactors and find median for global_gain header
+        threadgroup int iso_sf_arr[64];
+        int iso_count = 0;
+        int iso_sum = 0;
+        for (int sb = 0; sb < num_sfb; sb++) {
+            int sf_int = scalefactors[b * num_sfb + sb];
+            int isf = 157 - (gg - sf_int * 4) / 3;
+            if (isf < 0) isf = 0;
+            if (isf > 255) isf = 255;
+            iso_sf_arr[sb] = isf;
+            if (sfb_cb[sb] != 0) {
+                iso_sum += isf;
+                iso_count++;
+            }
+        }
+        int iso_gg = (iso_count > 0) ? (iso_sum / iso_count) : 100;
+
+        // Now write header with the ISO global_gain
+        write_bits_seq(raw, bp, 0, 3); bp += 3;  // ID_SCE
+        write_bits_seq(raw, bp, 0, 4); bp += 4;  // instance_tag
+        write_bits_seq(raw, bp, (uint)iso_gg & 0xFF, 8); bp += 8;
+
+        // ics_info
+        write_bits_seq(raw, bp, 0, 1); bp += 1;  // reserved
+        write_bits_seq(raw, bp, (uint)wseq & 3, 2); bp += 2;
+        write_bits_seq(raw, bp, 1, 1); bp += 1;  // KBD
+        write_bits_seq(raw, bp, (uint)num_sfb & 0x3F, 6); bp += 6;
+        write_bits_seq(raw, bp, 0, 1); bp += 1;  // predictor=0
+
+        // section_data
         int k = 0;
         while (k < num_sfb) {
             int cb = sfb_cb[k];
@@ -569,20 +591,17 @@ kernel void kernel_encode_raw_data_block(
             k = j;
         }
 
-        // scale_factor_data: DPCM with SF codebook
-        int prev_sf = gg;
+        // scale_factor_data: DPCM from iso_gg
+        int prev_sf = iso_gg;
         for (int sb = 0; sb < num_sfb; sb++) {
             if (sfb_cb[sb] == 0) continue;
-            int iso_sf = gg - scalefactors[b * num_sfb + sb];
-            if (iso_sf < 0) iso_sf = 0;
-            if (iso_sf > 255) iso_sf = 255;
-            int diff = iso_sf - prev_sf;
+            int diff = iso_sf_arr[sb] - prev_sf;
             if (diff < -60) diff = -60;
             if (diff > 60) diff = 60;
             int idx = diff + 60;
             HuffEntry e = sf_lut[idx];
             write_bits_seq(raw, bp, e.code, e.bits); bp += e.bits;
-            prev_sf = iso_sf;
+            prev_sf = iso_sf_arr[sb];
         }
 
         // pulse/tns/gain control

@@ -194,18 +194,23 @@ def encode_raw_data_block(
     sfb_offsets = get_sfb_offsets(sample_rate)
     num_sfb = len(sfb_offsets) - 1
 
-    # Clamp quantized values to avoid ESC overflow in decoders.
-    # Max safe escape: count=4 → value < 2^8 = 256.
     quantized = np.clip(quantized, -255, 255)
+
+    # Compute ISO scalefactors and derive the correct global_gain for the header.
+    # ISO decoder: x_hat = |q|^(4/3) * 2^(0.25*(sf-100))
+    # Our quantizer: q = |x|^(3/4) * 2^((gg - internal_sf*4)/16)
+    # For round-trip: iso_sf = 100 - (gg - internal_sf*4) / 3
+    sections = _compute_sections(quantized, sfb_offsets)
+    iso_sfs = [max(0, min(255, int(round(157 - (global_gain - int(scalefactors[sb])*4) / 3.0)))) for sb in range(num_sfb)]
+    non_zero_sfs = [iso_sfs[sb] for sb in range(num_sfb)
+                    if any(s <= sb < e and cb != ZERO_HCB for s, e, cb in sections)]
+    iso_global_gain = int(np.median(non_zero_sfs)) if non_zero_sfs else 100
 
     bw = BitWriter()
 
-    # ID_SCE (3 bits) + element_instance_tag (4 bits)
     bw.write(0, 3)  # ID_SCE = 0
     bw.write(0, 4)  # instance_tag = 0
-
-    # global_gain (8 bits)
-    bw.write(global_gain & 0xFF, 8)
+    bw.write(iso_global_gain & 0xFF, 8)  # global_gain in ISO convention
 
     # ---- ics_info ----
     bw.write(0, 1)  # ics_reserved_bit
@@ -220,7 +225,7 @@ def encode_raw_data_block(
         bw.write(0, 1)  # predictor_data_present = 0 (LC profile)
 
     # ---- section_data ----
-    sections = _compute_sections(quantized, sfb_offsets)
+    # (sections already computed above for ISO SF derivation)
     # ISO: short windows use 3-bit section lengths (esc=7), long use 5-bit (esc=31)
     if window_sequence == 2:
         sect_esc_val = 7
@@ -239,11 +244,10 @@ def encode_raw_data_block(
 
     # ---- scale_factor_data ----
     # Convert internal scalefactors to ISO DPCM.
-    # Internal SF (0-60) maps to ISO SF via: iso_sf = global_gain - internal_sf
-    # Clamp to [0, 255] to stay within AAC valid range, and ensure
-    # consecutive diffs stay within SF Huffman codebook range [-60, +60].
-    iso_sfs = [max(0, min(255, global_gain - int(scalefactors[sb]))) for sb in range(num_sfb)]
-    prev_sf = global_gain
+    # The ISO decoder reconstructs: x_hat = |q|^(4/3) * 2^(0.25*(sf-100))
+    # Our quantizer uses: q = |x|^(3/4) * 2^((gg - internal_sf*4)/16)
+    # For round-trip correctness: iso_sf = 100 - (gg - internal_sf*4) / 3
+    prev_sf = iso_global_gain
     for sb in range(num_sfb):
         cb = ZERO_HCB
         for s_start, s_end, s_cb in sections:
