@@ -286,7 +286,16 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
     with Timer() as t:
         if config.output_format == "adts":
             writer = ADTSWriter(config.sample_rate, 1)
-            _encode_adts_frames(writer, q, sf, gg, window_seqs, config)
+            try:
+                from metal_aac.core.metal_bridge import MetalHuffman
+                metal_ctx = MetalHuffman.shared()
+                rdb_list = metal_ctx.encode_adts_frames(
+                    q, sf, gg, window_seqs, config.sample_rate
+                )
+                for rdb in rdb_list:
+                    writer.write_frame(rdb)
+            except (OSError, RuntimeError, FileNotFoundError):
+                _encode_adts_frames(writer, q, sf, gg, window_seqs, config)
         else:
             try:
                 from metal_aac.core.metal_bridge import MetalHuffman

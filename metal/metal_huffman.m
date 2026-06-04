@@ -17,6 +17,7 @@ struct MetalHuffmanCtx {
     void* pso_decode;
     void* pso_quantize;
     void* pso_compute_sf;
+    void* pso_encode_rdb;
 };
 
 #define DEV(ctx) ((__bridge id<MTLDevice>)(ctx)->device)
@@ -131,6 +132,10 @@ MetalHuffmanCtx* metal_huffman_create(void) {
         if (!p) goto fail;
         ctx->pso_compute_sf = _retain(p);
 
+        p = _make_pso(device, library, "kernel_encode_raw_data_block");
+        if (!p) goto fail;
+        ctx->pso_encode_rdb = _retain(p);
+
         return ctx;
 
     fail:
@@ -150,6 +155,7 @@ void metal_huffman_destroy(MetalHuffmanCtx* ctx) {
     if (ctx->pso_decode)   CFBridgingRelease(ctx->pso_decode);
     if (ctx->pso_quantize) CFBridgingRelease(ctx->pso_quantize);
     if (ctx->pso_compute_sf) CFBridgingRelease(ctx->pso_compute_sf);
+    if (ctx->pso_encode_rdb) CFBridgingRelease(ctx->pso_encode_rdb);
     free(ctx);
 }
 
@@ -507,4 +513,89 @@ int metal_huffman_quantize(MetalHuffmanCtx* ctx,
         if (rc != 0) return rc;
     }
     return 0;
+}
+
+// ---- Metal ISO raw_data_block encoding ----
+
+int metal_encode_adts_frames(MetalHuffmanCtx* ctx,
+                              const int32_t* quantized,
+                              const int32_t* scalefactors,
+                              const int32_t* global_gains,
+                              const int32_t* window_seqs,
+                              const int32_t* sfb_offsets_arr,
+                              const void* cb_lut_data,
+                              int32_t cb_lut_bytes,
+                              const int32_t* cb_offsets,
+                              const int32_t* cb_dims,
+                              const int32_t* cb_signed,
+                              const int32_t* cb_max_abs,
+                              const void* sf_lut_data,
+                              int32_t sf_lut_bytes,
+                              int32_t B, int32_t N, int32_t num_sfb,
+                              int32_t max_frame_bytes,
+                              uint8_t* output_buf,
+                              int32_t* frame_sizes) {
+    @autoreleasepool {
+        id<MTLDevice> dev = DEV(ctx);
+
+        // Create buffers
+        id<MTLBuffer> buf_q  = [dev newBufferWithBytes:quantized length:(size_t)B*N*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_sf = [dev newBufferWithBytes:scalefactors length:(size_t)B*num_sfb*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_gg = [dev newBufferWithBytes:global_gains length:B*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_ws = [dev newBufferWithBytes:window_seqs length:B*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_sfb = [dev newBufferWithBytes:sfb_offsets_arr length:(num_sfb+1)*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_cblut = [dev newBufferWithBytes:cb_lut_data length:cb_lut_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_cboff = [dev newBufferWithBytes:cb_offsets length:12*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_cbdim = [dev newBufferWithBytes:cb_dims length:12*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_cbsig = [dev newBufferWithBytes:cb_signed length:12*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_cbmab = [dev newBufferWithBytes:cb_max_abs length:12*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_sflut = [dev newBufferWithBytes:sf_lut_data length:sf_lut_bytes options:MTLResourceStorageModeShared];
+
+        size_t out_size = (size_t)B * max_frame_bytes;
+        id<MTLBuffer> buf_out = [dev newBufferWithLength:out_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_sz = [dev newBufferWithLength:B*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_N = [dev newBufferWithBytes:&N length:4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_ns = [dev newBufferWithBytes:&num_sfb length:4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_mfb = [dev newBufferWithBytes:&max_frame_bytes length:4 options:MTLResourceStorageModeShared];
+
+        // Zero output
+        memset(buf_out.contents, 0, out_size);
+
+        id<MTLCommandBuffer> cmd = [QUEUE(ctx) commandBuffer];
+        {
+            id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+            [e setComputePipelineState:PSO(ctx->pso_encode_rdb)];
+            [e setBuffer:buf_q    offset:0 atIndex:0];
+            [e setBuffer:buf_sf   offset:0 atIndex:1];
+            [e setBuffer:buf_gg   offset:0 atIndex:2];
+            [e setBuffer:buf_ws   offset:0 atIndex:3];
+            [e setBuffer:buf_sfb  offset:0 atIndex:4];
+            [e setBuffer:buf_cblut offset:0 atIndex:5];
+            [e setBuffer:buf_cboff offset:0 atIndex:6];
+            [e setBuffer:buf_cbdim offset:0 atIndex:7];
+            [e setBuffer:buf_cbsig offset:0 atIndex:8];
+            [e setBuffer:buf_cbmab offset:0 atIndex:9];
+            [e setBuffer:buf_sflut offset:0 atIndex:10];
+            [e setBuffer:buf_out  offset:0 atIndex:11];
+            [e setBuffer:buf_sz   offset:0 atIndex:12];
+            [e setBuffer:buf_N    offset:0 atIndex:13];
+            [e setBuffer:buf_ns   offset:0 atIndex:14];
+            [e setBuffer:buf_mfb  offset:0 atIndex:15];
+            [e dispatchThreadgroups:MTLSizeMake(B, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+            [e endEncoding];
+        }
+
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        if (cmd.error) {
+            NSLog(@"Metal encode_rdb: %@", cmd.error);
+            return -1;
+        }
+
+        memcpy(output_buf, buf_out.contents, out_size);
+        memcpy(frame_sizes, buf_sz.contents, B * 4);
+        return 0;
+    }
 }

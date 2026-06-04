@@ -39,6 +39,29 @@ int metal_huffman_decode(
 
 int metal_huffman_max_frame_bytes(int32_t N, int32_t num_sfb);
 
+int metal_encode_adts_frames(
+    MetalHuffmanCtx* ctx,
+    const int32_t* quantized,
+    const int32_t* scalefactors,
+    const int32_t* global_gains,
+    const int32_t* window_seqs,
+    const int32_t* sfb_offsets_arr,
+    const void* cb_lut_data,
+    int32_t cb_lut_bytes,
+    const int32_t* cb_offsets,
+    const int32_t* cb_dims,
+    const int32_t* cb_signed,
+    const int32_t* cb_max_abs,
+    const void* sf_lut_data,
+    int32_t sf_lut_bytes,
+    int32_t B,
+    int32_t N,
+    int32_t num_sfb,
+    int32_t max_frame_bytes,
+    uint8_t* output_buf,
+    int32_t* frame_sizes
+);
+
 int metal_huffman_quantize(
     MetalHuffmanCtx* ctx,
     const float* mdct_coeffs,
