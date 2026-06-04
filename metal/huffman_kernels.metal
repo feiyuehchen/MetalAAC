@@ -545,24 +545,15 @@ kernel void kernel_encode_raw_data_block(
             sfb_cb[sb] = cb;
         }
 
-        // Compute ISO scalefactors and find median for global_gain header
+        // Scalefactors are ISO-native (100-255) since v0.6.0, use directly
         threadgroup int iso_sf_arr[64];
-        int iso_count = 0;
-        int iso_sum = 0;
         for (int sb = 0; sb < num_sfb; sb++) {
-            int sf_int = scalefactors[b * num_sfb + sb];
-            // Round to nearest (match Python's round()) instead of truncating
-            int num = gg - sf_int * 4;
-            int isf = 200 - (num >= 0 ? (num + 1) / 3 : (num - 1) / 3);
+            int isf = scalefactors[b * num_sfb + sb];
             if (isf < 0) isf = 0;
             if (isf > 255) isf = 255;
             iso_sf_arr[sb] = isf;
-            if (sfb_cb[sb] != 0) {
-                iso_sum += isf;
-                iso_count++;
-            }
         }
-        int iso_gg = (iso_count > 0) ? (iso_sum / iso_count) : 100;
+        int iso_gg = gg;
 
         // Now write header with the ISO global_gain
         write_bits_seq(raw, bp, 0, 3); bp += 3;  // ID_SCE

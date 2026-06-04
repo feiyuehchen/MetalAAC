@@ -5,6 +5,49 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-06-04
+
+### Changed
+- **Metal ADTS kernel uses ISO-native scalefactors directly**: removed legacy SF
+  mapping formula (`200 - (gg - sf_int*4)/3`), which was redundant since v0.6.0's
+  ISO-native quantizer already outputs direct ISO SF values.
+- **ADTS encoder path now uses Metal GPU** instead of Python `encode_raw_data_block_iso`
+  loop, with automatic CPU fallback.
+
+### Performance
+- ADTS Huffman+bitstream: **238ms → 10ms** (24x speedup)
+- Total ADTS 60s encode: **314ms → 82ms** (3.8x speedup)
+- Output is **byte-identical** to Python path (verified all frames)
+
+### Fixed
+- `pyproject.toml` version synced with git tags (was 0.4.0, now 0.6.1)
+
+## [0.6.0] - 2026-06-04
+
+### Changed
+- **ISO-native quantizer**: `quantize_batch_gpu()` now outputs direct ISO SF values
+  (100-255) instead of internal format. No mapping needed for ADTS bitstream.
+- ISO formula: `q = nint((|x| * 2^((200-sf)/4))^0.75)`
+
+### Quality
+- 440 Hz sine: **SNR = 46.6 dB** (was 25.6 dB in v0.5.0)
+- 1 kHz sine: **SNR = 46.9 dB**
+- Multi-tone: **SNR = 34.8 dB**
+
+## [0.5.0] - 2026-06-04
+
+### Changed
+- **MDCT 2/N normalization**: forward basis includes 2/N factor so coefficients are
+  in PCM scale. Inverse basis has no additional factor.
+- ISO standard quantization formulas now work correctly with normalized MDCT.
+
+### Fixed
+- 4 compliance fixes: buffer_fullness, bitrate calculation, short window section
+  escape, SF tuning for normalized MDCT.
+
+### Quality
+- 440 Hz sine: **SNR = 25.6 dB** (was 13.3 dB in v0.4.0)
+
 ## [0.4.0] - 2026-06-03
 
 ### Fixed
