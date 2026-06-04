@@ -441,3 +441,288 @@ kernel void kernel_decode_frames(
         quantized_out[b * N + i] = value;
     }
 }
+
+// ============================================================
+// ISO AAC-LC raw_data_block encoding kernel
+//
+// Writes a complete SCE (single_channel_element) per frame:
+//   ID_SCE + tag + global_gain + ics_info + section_data +
+//   scale_factor_data + pulse/tns/gain + spectral_data + ID_END
+//
+// One threadgroup per frame, 1024 threads per TG.
+// Thread 0 handles sequential header; all threads do spectral.
+// ============================================================
+
+struct HuffEntry {
+    uint32_t code;
+    uint8_t  bits;
+    uint8_t  pad[3];
+};
+
+// Helper: write a fixed-width field using thread 0 (non-atomic, sequential)
+inline void write_bits_seq(
+    threadgroup uint32_t* buf,
+    uint32_t bit_pos,
+    uint32_t cw,
+    uint16_t len)
+{
+    for (uint k = 0; k < (uint)len; k++) {
+        uint gbit = bit_pos + k;
+        uint widx = gbit / 32u;
+        uint binw = 31u - (gbit % 32u);
+        uint bval = (cw >> ((uint)len - 1u - k)) & 1u;
+        buf[widx] |= (bval << binw);
+    }
+}
+
+kernel void kernel_encode_raw_data_block(
+    device const int32_t*  quantized        [[buffer(0)]],   // (B*N)
+    device const int32_t*  scalefactors     [[buffer(1)]],   // (B*num_sfb)
+    device const int32_t*  global_gains     [[buffer(2)]],   // (B,)
+    device const int32_t*  window_seqs      [[buffer(3)]],   // (B,)
+    device const int32_t*  sfb_offsets_buf  [[buffer(4)]],   // (num_sfb+1,)
+    constant HuffEntry*    cb_luts          [[buffer(5)]],   // all codebook entries, flattened
+    constant int32_t*      cb_offsets       [[buffer(6)]],   // offset into cb_luts per codebook (12 entries)
+    constant int32_t*      cb_dims          [[buffer(7)]],   // dimension per codebook (12 entries: 0,4,4,4,4,2,2,2,2,2,2,2)
+    constant int32_t*      cb_signed        [[buffer(8)]],   // signed flag per codebook
+    constant int32_t*      cb_max_abs       [[buffer(9)]],   // max abs per codebook
+    constant HuffEntry*    sf_lut           [[buffer(10)]],  // SF codebook (121 entries)
+    device uint8_t*        output_buf       [[buffer(11)]],  // (B*max_frame_bytes)
+    device int32_t*        frame_sizes      [[buffer(12)]],  // (B,)
+    constant int32_t&      N               [[buffer(13)]],
+    constant int32_t&      num_sfb         [[buffer(14)]],
+    constant int32_t&      max_frame_bytes [[buffer(15)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint gid [[threadgroup_position_in_grid]])
+{
+    // 560 uint32 words = 2240 bytes staging buffer
+    threadgroup atomic_uint shared_words[560];
+    // Per-SFB codebook selection (computed by thread 0, read by all)
+    threadgroup int32_t sfb_cb[64];  // max 64 SFBs
+    threadgroup uint32_t header_bits;  // total header bit count
+
+    uint b = gid;
+
+    // Zero shared buffer
+    for (uint i = tid; i < 560u; i += 1024u) {
+        atomic_store_explicit(&shared_words[i], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Thread 0: compute sections + write header ----
+    if (tid == 0u) {
+        int32_t gg = global_gains[b];
+        int32_t wseq = window_seqs[b];
+        threadgroup uint32_t* raw = (threadgroup uint32_t*)shared_words;
+        uint bp = 0;
+
+        // ID_SCE(3) + tag(4) + global_gain(8)
+        write_bits_seq(raw, bp, 0, 3); bp += 3;
+        write_bits_seq(raw, bp, 0, 4); bp += 4;
+        write_bits_seq(raw, bp, (uint)gg & 0xFF, 8); bp += 8;
+
+        // ics_info
+        write_bits_seq(raw, bp, 0, 1); bp += 1;  // reserved
+        write_bits_seq(raw, bp, (uint)wseq & 3, 2); bp += 2;
+        write_bits_seq(raw, bp, 1, 1); bp += 1;  // KBD
+        write_bits_seq(raw, bp, (uint)num_sfb & 0x3F, 6); bp += 6;  // max_sfb
+        write_bits_seq(raw, bp, 0, 1); bp += 1;  // predictor=0
+
+        // Compute per-SFB codebook from max abs value
+        for (int sb = 0; sb < num_sfb; sb++) {
+            int lo = sfb_offsets_buf[sb];
+            int hi = sfb_offsets_buf[sb + 1];
+            int max_abs = 0;
+            for (int j = lo; j < hi; j++) {
+                int v = quantized[b * N + j];
+                int av = (v >= 0) ? v : -v;
+                if (av > max_abs) max_abs = av;
+            }
+            // Clamp to 255 for ESC safety
+            if (max_abs > 255) max_abs = 255;
+
+            int cb;
+            if (max_abs == 0) cb = 0;
+            else if (max_abs <= 1) cb = 1;
+            else if (max_abs <= 2) cb = 3;
+            else if (max_abs <= 4) cb = 5;
+            else if (max_abs <= 7) cb = 7;
+            else if (max_abs <= 12) cb = 9;
+            else cb = 11;
+            sfb_cb[sb] = cb;
+        }
+
+        // section_data: merge adjacent SFBs with same codebook
+        int k = 0;
+        while (k < num_sfb) {
+            int cb = sfb_cb[k];
+            int j = k + 1;
+            while (j < num_sfb && sfb_cb[j] == cb) j++;
+            int sect_len = j - k;
+
+            write_bits_seq(raw, bp, (uint)cb & 0xF, 4); bp += 4;
+            while (sect_len >= 31) {
+                write_bits_seq(raw, bp, 31, 5); bp += 5;
+                sect_len -= 31;
+            }
+            write_bits_seq(raw, bp, (uint)sect_len, 5); bp += 5;
+            k = j;
+        }
+
+        // scale_factor_data: DPCM with SF codebook
+        int prev_sf = gg;
+        for (int sb = 0; sb < num_sfb; sb++) {
+            if (sfb_cb[sb] == 0) continue;
+            int iso_sf = gg - scalefactors[b * num_sfb + sb];
+            if (iso_sf < 0) iso_sf = 0;
+            if (iso_sf > 255) iso_sf = 255;
+            int diff = iso_sf - prev_sf;
+            if (diff < -60) diff = -60;
+            if (diff > 60) diff = 60;
+            int idx = diff + 60;
+            HuffEntry e = sf_lut[idx];
+            write_bits_seq(raw, bp, e.code, e.bits); bp += e.bits;
+            prev_sf = iso_sf;
+        }
+
+        // pulse/tns/gain control
+        write_bits_seq(raw, bp, 0, 1); bp += 1;
+        write_bits_seq(raw, bp, 0, 1); bp += 1;
+        write_bits_seq(raw, bp, 0, 1); bp += 1;
+
+        header_bits = bp;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Thread 0: sequential spectral encoding ----
+    // Each frame's spectral data is small (<500 bytes), sequential on one GPU
+    // thread is fast enough. The win is from running B frames in parallel.
+    if (tid == 0u) {
+        threadgroup uint32_t* raw = (threadgroup uint32_t*)shared_words;
+        uint bp = header_bits;
+
+        for (int sb = 0; sb < num_sfb; sb++) {
+            int cb = sfb_cb[sb];
+            if (cb == 0 || cb < 1 || cb > 11) continue;
+
+            int is_signed = cb_signed[cb];
+            int dim = cb_dims[cb];
+            int mabs = cb_max_abs[cb];
+            int cb_off = cb_offsets[cb];
+            int dim_size = is_signed ? (2 * mabs + 1) : (mabs + 1);
+
+            int lo = sfb_offsets_buf[sb];
+            int hi = sfb_offsets_buf[sb + 1];
+
+            if (dim == 4) {
+                for (int i = lo; i < hi; i += 4) {
+                    int vals[4];
+                    for (int k = 0; k < 4; k++) {
+                        int v = (i+k < N) ? quantized[b*N + i+k] : 0;
+                        if (v > 255) v = 255; if (v < -255) v = -255;
+                        vals[k] = v;
+                    }
+                    int lookup[4];
+                    if (is_signed) {
+                        for (int k = 0; k < 4; k++) lookup[k] = vals[k] + mabs;
+                    } else {
+                        for (int k = 0; k < 4; k++) {
+                            int av = (vals[k] >= 0) ? vals[k] : -vals[k];
+                            if (av > mabs) av = mabs;
+                            lookup[k] = av;
+                        }
+                    }
+                    int idx = lookup[0]*dim_size*dim_size*dim_size + lookup[1]*dim_size*dim_size + lookup[2]*dim_size + lookup[3];
+                    HuffEntry e = cb_luts[cb_off + idx];
+                    write_bits_seq(raw, bp, e.code, e.bits); bp += e.bits;
+
+                    if (!is_signed) {
+                        for (int k = 0; k < 4; k++) {
+                            int av = (vals[k] >= 0) ? vals[k] : -vals[k];
+                            if (av > 0) {
+                                write_bits_seq(raw, bp, (vals[k] < 0) ? 1 : 0, 1); bp += 1;
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (int i = lo; i < hi; i += 2) {
+                    int v0 = (i < N) ? quantized[b*N + i] : 0;
+                    int v1 = (i+1 < N) ? quantized[b*N + i+1] : 0;
+                    if (v0 > 255) v0 = 255; if (v0 < -255) v0 = -255;
+                    if (v1 > 255) v1 = 255; if (v1 < -255) v1 = -255;
+
+                    int a0, a1;
+                    if (is_signed) {
+                        a0 = v0 + mabs; a1 = v1 + mabs;
+                    } else {
+                        a0 = (v0 >= 0) ? v0 : -v0;
+                        a1 = (v1 >= 0) ? v1 : -v1;
+                        int clamp = (cb == 11) ? 16 : mabs;
+                        if (a0 > clamp) a0 = clamp;
+                        if (a1 > clamp) a1 = clamp;
+                    }
+
+                    int idx = a0 * dim_size + a1;
+                    HuffEntry e = cb_luts[cb_off + idx];
+                    write_bits_seq(raw, bp, e.code, e.bits); bp += e.bits;
+
+                    if (!is_signed) {
+                        // Sign bits: written for any non-zero value (using clamped abs)
+                        if (a0 > 0) {
+                            write_bits_seq(raw, bp, (v0 < 0) ? 1 : 0, 1); bp += 1;
+                        }
+                        if (a1 > 0) {
+                            write_bits_seq(raw, bp, (v1 < 0) ? 1 : 0, 1); bp += 1;
+                        }
+
+                        // Escape coding for CB11
+                        if (cb == 11) {
+                            int orig0 = (v0 >= 0) ? v0 : -v0;
+                            int orig1 = (v1 >= 0) ? v1 : -v1;
+                            if (orig0 >= 16) {
+                                int n = orig0;
+                                int count = 0;
+                                while (n >= (1 << (count + 4))) count++;
+                                for (int c = 0; c < count; c++) {
+                                    write_bits_seq(raw, bp, 1, 1); bp += 1;
+                                }
+                                write_bits_seq(raw, bp, 0, 1); bp += 1;
+                                write_bits_seq(raw, bp, n, count + 4); bp += count + 4;
+                            }
+                            if (orig1 >= 16) {
+                                int n = orig1;
+                                int count = 0;
+                                while (n >= (1 << (count + 4))) count++;
+                                for (int c = 0; c < count; c++) {
+                                    write_bits_seq(raw, bp, 1, 1); bp += 1;
+                                }
+                                write_bits_seq(raw, bp, 0, 1); bp += 1;
+                                write_bits_seq(raw, bp, n, count + 4); bp += count + 4;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ID_END
+        write_bits_seq(raw, bp, 7, 3); bp += 3;
+
+        // Convert uint32 words to bytes (big-endian) in output
+        uint total_bytes = (bp + 7u) / 8u;
+        uint total_words = (total_bytes + 3u) / 4u;
+        device uint8_t* out = output_buf + b * (uint)max_frame_bytes;
+
+        for (uint i = 0; i < total_words; i++) {
+            uint32_t w = atomic_load_explicit(&shared_words[i], memory_order_relaxed);
+            uint base = i * 4u;
+            if (base < total_bytes) out[base] = (uint8_t)(w >> 24);
+            if (base+1 < total_bytes) out[base+1] = (uint8_t)(w >> 16);
+            if (base+2 < total_bytes) out[base+2] = (uint8_t)(w >> 8);
+            if (base+3 < total_bytes) out[base+3] = (uint8_t)w;
+        }
+
+        frame_sizes[b] = (int32_t)total_bytes;
+    }
+}

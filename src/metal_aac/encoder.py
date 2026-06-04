@@ -38,6 +38,7 @@ from metal_aac.core.huffman import (
     encode_frames_parallel,
     encode_spectral_data,
 )
+from metal_aac.core.raw_data_block import encode_raw_data_block
 from metal_aac.core.mdct import (
     MDCTBasis,
     MDCTBasisGPU,
@@ -72,7 +73,7 @@ class EncoderConfig:
     window_type: str = "kbd"
     target_bitrate_kbps: float = 128.0
     use_gpu: bool = True
-    output_format: str = "adts"
+    output_format: str = "legacy"
     enable_window_switching: bool = True
 
     @property
@@ -93,6 +94,18 @@ class EncoderResult:
     audio_duration: float
     window_sequences: np.ndarray | None = None
     timings: dict[str, float] = field(default_factory=dict)
+
+
+def _encode_adts_frames(writer, q, sf, gg, window_seqs, config):
+    """CPU fallback: encode all frames as ADTS raw_data_blocks."""
+    n_frames = len(q)
+    for i in range(n_frames):
+        rdb = encode_raw_data_block(
+            q[i], sf[i], int(gg[i]),
+            window_sequence=int(window_seqs[i]),
+            sample_rate=config.sample_rate,
+        )
+        writer.write_frame(rdb)
 
 
 def encode(pcm: np.ndarray, config: EncoderConfig | None = None) -> EncoderResult:
@@ -149,19 +162,25 @@ def _encode_cpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
     with Timer() as t:
         if config.output_format == "adts":
             writer = ADTSWriter(config.sample_rate, 1)
+            for i in range(num_frames):
+                rdb = encode_raw_data_block(
+                    quant_result.quantized[i],
+                    quant_result.scalefactors[i],
+                    int(quant_result.global_gain[i]),
+                    window_sequence=int(window_seqs[i]),
+                    sample_rate=config.sample_rate,
+                )
+                writer.write_frame(rdb)
         else:
             writer = BitstreamWriter()
-        num_sfb = get_num_sfb(config.sample_rate)
-        for i in range(num_frames):
-            spectral_bytes = encode_spectral_data(
-                quant_result.quantized[i],
-                quant_result.scalefactors[i],
-                int(quant_result.global_gain[i]),
-                config.sample_rate,
-            )
-            if config.output_format == "adts":
-                writer.write_frame(spectral_bytes)
-            else:
+            num_sfb = get_num_sfb(config.sample_rate)
+            for i in range(num_frames):
+                spectral_bytes = encode_spectral_data(
+                    quant_result.quantized[i],
+                    quant_result.scalefactors[i],
+                    int(quant_result.global_gain[i]),
+                    config.sample_rate,
+                )
                 writer.write_frame(spectral_bytes, config.sample_rate, 1, num_sfb)
     timings["huffman_bitstream"] = t.elapsed
 
@@ -242,9 +261,6 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
                 config.sample_rate,
             )
         timings["quantization"] = t.elapsed
-
-        with Timer() as t:
-            encoded_frames = metal.encode_frames(q, sf, gg)
     except (OSError, RuntimeError, FileNotFoundError):
         with Timer() as t:
             quant_result = quantize_batch_gpu(
@@ -257,21 +273,33 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
         sf = quant_result.scalefactors
         gg = quant_result.global_gain
 
-        with Timer() as t:
-            encoded_frames = encode_frames_parallel(
-                q, sf, gg, config.sample_rate,
-            )
-
-    # ---- Bitstream assembly ----
-    if config.output_format == "adts":
-        writer = ADTSWriter(config.sample_rate, 1)
-        for spectral_bytes in encoded_frames:
-            writer.write_frame(spectral_bytes)
-    else:
-        writer = BitstreamWriter()
-        num_sfb = get_num_sfb(config.sample_rate)
-        for spectral_bytes in encoded_frames:
-            writer.write_frame(spectral_bytes, config.sample_rate, 1, num_sfb)
+    # ---- Huffman + bitstream assembly ----
+    with Timer() as t:
+        if config.output_format == "adts":
+            writer = ADTSWriter(config.sample_rate, 1)
+            try:
+                from metal_aac.core.metal_bridge import MetalHuffman
+                metal_ctx = MetalHuffman.shared()
+                rdb_list = metal_ctx.encode_adts_frames(
+                    q, sf, gg, window_seqs, config.sample_rate
+                )
+                for rdb in rdb_list:
+                    writer.write_frame(rdb)
+            except (OSError, RuntimeError, FileNotFoundError):
+                _encode_adts_frames(writer, q, sf, gg, window_seqs, config)
+        else:
+            try:
+                from metal_aac.core.metal_bridge import MetalHuffman
+                metal = MetalHuffman.shared()
+                encoded_frames = metal.encode_frames(q, sf, gg)
+            except (OSError, RuntimeError, FileNotFoundError):
+                encoded_frames = encode_frames_parallel(
+                    q, sf, gg, config.sample_rate,
+                )
+            writer = BitstreamWriter()
+            num_sfb = get_num_sfb(config.sample_rate)
+            for spectral_bytes in encoded_frames:
+                writer.write_frame(spectral_bytes, config.sample_rate, 1, num_sfb)
     timings["huffman_bitstream"] = t.elapsed
 
     bitstream = writer.get_bytes()

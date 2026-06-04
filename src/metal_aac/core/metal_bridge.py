@@ -105,6 +105,106 @@ class MetalHuffman:
             result.append(bytes(output[start:end]))
         return result
 
+    def encode_adts_frames(
+        self,
+        quantized: np.ndarray,
+        scalefactors: np.ndarray,
+        global_gains: np.ndarray,
+        window_seqs: np.ndarray,
+        sample_rate: int = 44100,
+    ) -> list[bytes]:
+        """Encode all frames as ISO raw_data_blocks using Metal GPU."""
+        from metal_aac.tables.scalefactor_bands import get_sfb_offsets
+        from metal_aac.tables.huffman_tables import (
+            CODEBOOKS, SF_CODES, SF_CODE_VALUES, SF_CODE_LENGTHS,
+        )
+
+        B, N = quantized.shape
+        sfb_offsets = get_sfb_offsets(sample_rate)
+        num_sfb = len(sfb_offsets) - 1
+        max_bytes = self._lib.metal_huffman_max_frame_bytes(N, num_sfb)
+
+        cb_dims_arr = [0, 4, 4, 4, 4, 2, 2, 2, 2, 2, 2, 2]
+        cb_signed_arr = [0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0]
+        cb_max_abs_arr = [0, 1, 1, 2, 2, 4, 4, 7, 7, 12, 12, 16]
+
+        # Build codebook LUTs: HuffEntry = uint32 code + uint8 bits + pad[3] = 8 bytes
+        import struct as st
+        from metal_aac.tables import huffman_tables as ht
+
+        sizes = [0, 81, 81, 81, 81, 81, 81, 64, 64, 169, 169, 289]
+        cb_offsets_arr = [0] * 12
+        for i in range(2, 12):
+            cb_offsets_arr[i] = cb_offsets_arr[i - 1] + sizes[i - 1]
+
+        lut_data = bytearray()
+        for cb_idx in range(1, 12):
+            codes_arr = getattr(ht, f'CB{cb_idx}_CODES')
+            bits_arr = getattr(ht, f'CB{cb_idx}_LENGTHS')
+            for i in range(len(codes_arr)):
+                lut_data += st.pack('<IB3x', codes_arr[i], bits_arr[i])
+
+        sf_lut_data = bytearray()
+        for i in range(121):
+            sf_lut_data += st.pack('<IB3x', SF_CODE_VALUES[i], SF_CODE_LENGTHS[i])
+
+        q = np.ascontiguousarray(quantized, dtype=np.int32)
+        sf = np.ascontiguousarray(scalefactors, dtype=np.int32)
+        gg = np.ascontiguousarray(global_gains, dtype=np.int32)
+        ws = np.ascontiguousarray(window_seqs, dtype=np.int32)
+        sfb_arr = np.array(sfb_offsets, dtype=np.int32)
+        cb_off = np.array(cb_offsets_arr, dtype=np.int32)
+        cb_dim = np.array(cb_dims_arr, dtype=np.int32)
+        cb_sig = np.array(cb_signed_arr, dtype=np.int32)
+        cb_mab = np.array(cb_max_abs_arr, dtype=np.int32)
+
+        output = np.zeros(B * max_bytes, dtype=np.uint8)
+        frame_sizes = np.zeros(B, dtype=np.int32)
+
+        _c_float_p = ctypes.POINTER(ctypes.c_float)
+        if not hasattr(self._lib, '_adts_setup_done'):
+            self._lib.metal_encode_adts_frames.restype = ctypes.c_int
+            self._lib.metal_encode_adts_frames.argtypes = [
+                ctypes.c_void_p,
+                _c_int32_p, _c_int32_p, _c_int32_p, _c_int32_p, _c_int32_p,
+                ctypes.c_void_p, ctypes.c_int32,
+                _c_int32_p, _c_int32_p, _c_int32_p, _c_int32_p,
+                ctypes.c_void_p, ctypes.c_int32,
+                ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+                _c_uint8_p, _c_int32_p,
+            ]
+            self._lib._adts_setup_done = True
+
+        lut_bytes = bytes(lut_data)
+        sf_bytes = bytes(sf_lut_data)
+
+        rc = self._lib.metal_encode_adts_frames(
+            self._ctx,
+            q.ctypes.data_as(_c_int32_p),
+            sf.ctypes.data_as(_c_int32_p),
+            gg.ctypes.data_as(_c_int32_p),
+            ws.ctypes.data_as(_c_int32_p),
+            sfb_arr.ctypes.data_as(_c_int32_p),
+            lut_bytes, len(lut_bytes),
+            cb_off.ctypes.data_as(_c_int32_p),
+            cb_dim.ctypes.data_as(_c_int32_p),
+            cb_sig.ctypes.data_as(_c_int32_p),
+            cb_mab.ctypes.data_as(_c_int32_p),
+            sf_bytes, len(sf_bytes),
+            B, N, num_sfb, max_bytes,
+            output.ctypes.data_as(_c_uint8_p),
+            frame_sizes.ctypes.data_as(_c_int32_p),
+        )
+        if rc != 0:
+            raise RuntimeError(f"Metal ADTS encode failed (rc={rc})")
+
+        result = []
+        for b in range(B):
+            start = b * max_bytes
+            end = start + frame_sizes[b]
+            result.append(bytes(output[start:end]))
+        return result
+
     def decode_frames(
         self,
         frame_payloads: list[bytes],
