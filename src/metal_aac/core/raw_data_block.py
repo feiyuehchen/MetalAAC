@@ -175,6 +175,100 @@ def _write_escape(bw: BitWriter, value: int) -> None:
     bw.write(n, count + 4)
 
 
+def encode_raw_data_block_iso(
+    quantized: np.ndarray,
+    iso_scalefactors: np.ndarray,
+    iso_global_gain: int,
+    window_sequence: int = 0,
+    sample_rate: int = 44100,
+) -> bytes:
+    """Encode one frame with ISO scalefactors directly (no formula conversion).
+
+    iso_scalefactors: (num_sfb,) int32 — direct ISO SF values (100-255)
+    iso_global_gain: int — written directly as global_gain in ADTS header
+    """
+    sfb_offsets = get_sfb_offsets(sample_rate)
+    num_sfb = len(sfb_offsets) - 1
+    quantized = np.clip(quantized, -255, 255)
+    sections = _compute_sections(quantized, sfb_offsets)
+
+    bw = BitWriter()
+    bw.write(0, 3)
+    bw.write(0, 4)
+    bw.write(iso_global_gain & 0xFF, 8)
+
+    bw.write(0, 1)
+    bw.write(window_sequence & 0x3, 2)
+    bw.write(1, 1)
+    if window_sequence == 2:
+        bw.write(num_sfb & 0xF, 4)
+        bw.write(0x7F, 7)
+    else:
+        bw.write(num_sfb & 0x3F, 6)
+        bw.write(0, 1)
+
+    if window_sequence == 2:
+        sect_esc_val, sect_bits = 7, 3
+    else:
+        sect_esc_val, sect_bits = 31, 5
+
+    for start_sfb, end_sfb, cb in sections:
+        sect_len = end_sfb - start_sfb
+        bw.write(cb & 0xF, 4)
+        while sect_len >= sect_esc_val:
+            bw.write(sect_esc_val, sect_bits)
+            sect_len -= sect_esc_val
+        bw.write(sect_len, sect_bits)
+
+    prev_sf = iso_global_gain
+    for sb in range(num_sfb):
+        cb = ZERO_HCB
+        for s_start, s_end, s_cb in sections:
+            if s_start <= sb < s_end:
+                cb = s_cb
+                break
+        if cb == ZERO_HCB:
+            continue
+        diff = int(iso_scalefactors[sb]) - prev_sf
+        diff = max(-60, min(60, diff))
+        if diff in SF_CODES:
+            cw, cl = SF_CODES[diff]
+            bw.write(cw, cl)
+        else:
+            bw.write(0, 1)
+        prev_sf += diff
+
+    bw.write(0, 1)
+    bw.write(0, 1)
+    bw.write(0, 1)
+
+    q_list = quantized.tolist() if hasattr(quantized, 'tolist') else list(quantized)
+    n_coeffs = len(q_list)
+    for start_sfb, end_sfb, cb in sections:
+        if cb == ZERO_HCB:
+            continue
+        codebook = CODEBOOKS.get(cb)
+        if codebook is None:
+            continue
+        lo = sfb_offsets[start_sfb]
+        hi = min(sfb_offsets[end_sfb], n_coeffs)
+        if codebook.dimension == 4:
+            for i in range(lo, hi, 4):
+                v0 = q_list[i] if i < n_coeffs else 0
+                v1 = q_list[i+1] if i+1 < n_coeffs else 0
+                v2 = q_list[i+2] if i+2 < n_coeffs else 0
+                v3 = q_list[i+3] if i+3 < n_coeffs else 0
+                _encode_spectral_quad(bw, cb, v0, v1, v2, v3)
+        else:
+            for i in range(lo, hi, 2):
+                v0 = q_list[i] if i < n_coeffs else 0
+                v1 = q_list[i+1] if i+1 < n_coeffs else 0
+                _encode_spectral_pair(bw, cb, v0, v1)
+
+    bw.write(7, 3)
+    return bw.flush()
+
+
 def encode_raw_data_block(
     quantized: np.ndarray,
     scalefactors: np.ndarray,

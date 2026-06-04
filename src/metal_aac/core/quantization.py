@@ -297,15 +297,15 @@ def quantize_batch_gpu(
     sample_rate: int = 44100,
     max_iterations: int = 8,
 ) -> QuantizationResult:
-    """Fully GPU-vectorized quantization with rate control.
+    """ISO-native quantizer: uses sf as the ONLY parameter per band.
 
-    Instead of looping over each frame in Python, this function:
-    1. Computes scalefactors for ALL frames simultaneously on GPU
-    2. Runs the binary search with ALL frames evaluated in one GPU call per iteration
-    3. Returns results transferred back to CPU
+    ISO formula: q = nint((|x| * 2^((200-sf)/4))^0.75)
+    ISO dequant: x_hat = |q|^(4/3) * 2^((sf-200)/4)
+    Round-trip error is ONLY from integer rounding.
 
-    mdct_coeffs: (B, N) on GPU
-    masking_thresholds: (B, num_sfb) on GPU
+    Rate control: binary search on a uniform sf_offset applied to all bands.
+    Per-band differentiation via SMR-based relative offsets.
+    All vectorized across (B, N) via MLX.
     """
     batch, n_coeffs = mdct_coeffs.shape
     sfb_offsets = get_sfb_offsets(sample_rate)
@@ -313,7 +313,8 @@ def quantize_batch_gpu(
     sfb_map = _build_sfb_map(sfb_offsets, n_coeffs)
     sfb_map_mx = mx.array(sfb_map)
 
-    # Step 1: compute band power and scalefactors for all frames at once
+    # Step 1: per-band SMR → relative SF offsets.
+    # High SMR (loud signal, low masking) → lower sf → finer quantization.
     band_powers = mx.zeros((batch, num_sfb))
     for sb in range(num_sfb):
         lo, hi = sfb_offsets[sb], sfb_offsets[sb + 1]
@@ -322,60 +323,66 @@ def quantize_batch_gpu(
         )
 
     masking_safe = mx.maximum(masking_thresholds, 1e-20)
-    masking_safe = mx.where(
-        mx.isnan(masking_safe), band_powers, masking_safe
-    )
+    masking_safe = mx.where(mx.isnan(masking_safe), band_powers, masking_safe)
     smr_db = 10.0 * mx.log10(band_powers / masking_safe)
     smr_db = mx.where(mx.isnan(smr_db), mx.zeros_like(smr_db), smr_db)
-    scalefactors = mx.clip(40 - smr_db * 0.15, 0, 40).astype(mx.int32)
-    mx.eval(scalefactors)
 
-    # Step 2: vectorized binary search for global_gain across ALL frames
-    per_coeff_sf = scalefactors[:, sfb_map_mx]
+    # Relative offsets: high SMR → negative (lower sf = finer)
+    sf_rel = mx.clip(-smr_db * 0.15, -20, 0).astype(mx.int32)
+    mx.eval(sf_rel)
+
     abs_coeffs = mx.abs(mdct_coeffs)
-    powered = mx.power(abs_coeffs + 1e-20, 0.75)
-    mx.eval(per_coeff_sf, powered)
     target = mx.array(target_bits_per_frame, dtype=mx.float32)
 
-    gain_lo = mx.zeros(batch, dtype=mx.int32)
-    gain_hi = mx.full((batch,), 255, dtype=mx.int32)
-    best_gains = mx.zeros(batch, dtype=mx.int32)
+    # Step 2: binary search on sf_base (uniform level) to meet bit budget.
+    # iso_sf[band] = sf_base + sf_rel[band], clamped to [100, 255].
+    # Lower sf_base → larger q → more bits.
+    sf_base_lo = mx.full((batch,), 170, dtype=mx.int32)
+    sf_base_hi = mx.full((batch,), 210, dtype=mx.int32)
+    best_sf_base = mx.full((batch,), 200, dtype=mx.int32)
     best_bits = mx.zeros(batch, dtype=mx.float32)
 
     for _ in range(max_iterations):
-        gains = (gain_lo + gain_hi) // 2
-        gain_factor = mx.power(
-            2.0, (gains[:, None].astype(mx.float32) - per_coeff_sf * 4) / 16.0
-        )
-        q = mx.sign(mdct_coeffs) * mx.floor(powered * gain_factor + 0.4054)
-        q_int = q.astype(mx.int32)
+        sf_base = (sf_base_lo + sf_base_hi) // 2
+
+        # Per-coefficient ISO sf
+        per_band_sf = mx.clip(sf_base[:, None] + sf_rel, 100, 255)
+        per_coeff_sf = per_band_sf[:, sfb_map_mx].astype(mx.float32)
+
+        # ISO quantize: q = nint((|x| * 2^((200-sf)/4))^0.75)
+        iqf = mx.power(2.0, (200.0 - per_coeff_sf) / 4.0)
+        scaled = abs_coeffs * iqf
+        q = mx.sign(mdct_coeffs) * mx.round(mx.power(scaled + 1e-20, 0.75))
+        q_int = mx.clip(q, -255, 255).astype(mx.int32)
+
         bits = _gpu_estimate_bits(q_int)
-        max_abs = mx.max(mx.abs(q_int), axis=-1)
+        max_abs_q = mx.max(mx.abs(q_int), axis=-1)
 
-        fits = (bits <= target) & (max_abs <= 255)
-        best_gains = mx.where(fits, gains, best_gains)
+        # Lower sf = more bits. Find LOWEST sf where bits <= target.
+        fits = (bits <= target) & (max_abs_q <= 255)
+        best_sf_base = mx.where(fits, sf_base, best_sf_base)
         best_bits = mx.where(fits, bits, best_bits)
-        gain_lo = mx.where(fits, gains + 1, gain_lo)
-        gain_hi = mx.where(~fits, gains - 1, gain_hi)
-        mx.eval(gain_lo, gain_hi, best_gains, best_bits)
+        sf_base_hi = mx.where(fits, sf_base - 1, sf_base_hi)
+        sf_base_lo = mx.where(~fits, sf_base + 1, sf_base_lo)
+        mx.eval(sf_base_lo, sf_base_hi, best_sf_base, best_bits)
 
-    # Scalefactors are kept as-is from the initial SMR-based computation.
-    # The ISO SF mapping (iso_sf = 157 - (gg - sf*4)/3) in raw_data_block.py
-    # converts to ISO convention at bitstream writing time.
+    # Step 3: final quantization with best sf_base
+    final_sf = mx.clip(best_sf_base[:, None] + sf_rel, 100, 255)
+    per_coeff_sf_final = final_sf[:, sfb_map_mx].astype(mx.float32)
+    iqf_final = mx.power(2.0, (200.0 - per_coeff_sf_final) / 4.0)
+    scaled_final = abs_coeffs * iqf_final
+    final_q = mx.sign(mdct_coeffs) * mx.round(mx.power(scaled_final + 1e-20, 0.75))
+    final_q = mx.clip(final_q, -255, 255).astype(mx.int32)
+    mx.eval(final_q, final_sf)
 
-    # Step 4: final quantization with optimized gains + SFs
-    per_coeff_sf = scalefactors[:, sfb_map_mx]
-    final_gf = mx.power(
-        2.0,
-        (best_gains[:, None].astype(mx.float32) - per_coeff_sf * 4) / 16.0,
-    )
-    final_q = mx.sign(mdct_coeffs) * mx.floor(powered * final_gf + 0.4054)
-    final_q = final_q.astype(mx.int32)
-    mx.eval(final_q)
+    # Return: iso_scalefactors are the DIRECT ISO sf values (no mapping needed).
+    # global_gain = mean of ISO SFs for DPCM anchoring.
+    iso_sf_np = np.array(final_sf)
+    iso_gg = np.mean(iso_sf_np, axis=-1).astype(np.int32)
 
     return QuantizationResult(
         quantized=np.array(final_q),
-        scalefactors=np.array(scalefactors),
-        global_gain=np.array(best_gains),
+        scalefactors=iso_sf_np,  # NOW direct ISO SF values
+        global_gain=iso_gg,      # NOW direct ISO global_gain
         total_bits=np.array(best_bits, dtype=np.int32),
     )

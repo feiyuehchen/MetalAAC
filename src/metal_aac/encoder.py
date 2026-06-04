@@ -38,7 +38,7 @@ from metal_aac.core.huffman import (
     encode_frames_parallel,
     encode_spectral_data,
 )
-from metal_aac.core.raw_data_block import encode_raw_data_block
+from metal_aac.core.raw_data_block import encode_raw_data_block, encode_raw_data_block_iso
 from metal_aac.core.mdct import (
     MDCTBasis,
     MDCTBasisGPU,
@@ -274,34 +274,57 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
         mx.eval(masking_mx)
     timings["psychoacoustic"] = t.elapsed
 
-    # ---- Quantization: MLX two-loop (with outer SF iteration) ----
-    # Always use MLX quantizer for quality (includes outer SF loop).
-    # Metal quantizer is faster but has no outer loop — used only for legacy path.
-    with Timer() as t:
-        quant_result = quantize_batch_gpu(
-            mdct_mx, masking_mx,
-            config.target_bits_per_frame,
-            config.sample_rate,
-        )
-    timings["quantization"] = t.elapsed
-    q = quant_result.quantized
-    sf = quant_result.scalefactors
-    gg = quant_result.global_gain
+    # ---- Quantization ----
+    if config.output_format == "adts":
+        # ISO-native quantizer: sf is the only parameter per band.
+        # No mapping needed — sf goes directly to ADTS bitstream.
+        with Timer() as t:
+            quant_result = quantize_batch_gpu(
+                mdct_mx, masking_mx,
+                config.target_bits_per_frame,
+                config.sample_rate,
+            )
+        timings["quantization"] = t.elapsed
+        q = quant_result.quantized
+        sf = quant_result.scalefactors   # direct ISO sf values (100-255)
+        gg = quant_result.global_gain    # mean of ISO SFs for DPCM anchor
+    else:
+        # Legacy quantizer for internal round-trip
+        try:
+            from metal_aac.core.metal_bridge import MetalHuffman
+            metal = MetalHuffman.shared()
+            with Timer() as t:
+                mdct_np = np.array(mdct_mx)
+                masking_np = np.array(masking_mx)
+                q, sf, gg, _ = metal.quantize(
+                    mdct_np, masking_np,
+                    config.target_bits_per_frame, config.sample_rate,
+                )
+            timings["quantization"] = t.elapsed
+        except (OSError, RuntimeError, FileNotFoundError):
+            # CPU fallback with old formula
+            with Timer() as t:
+                quant_result = quantize_cpu(
+                    np.array(mdct_mx), np.array(masking_mx),
+                    config.target_bits_per_frame, config.sample_rate,
+                )
+            timings["quantization"] = t.elapsed
+            q = quant_result.quantized
+            sf = quant_result.scalefactors
+            gg = quant_result.global_gain
 
     # ---- Huffman + bitstream assembly ----
     with Timer() as t:
         if config.output_format == "adts":
             writer = ADTSWriter(config.sample_rate, 1)
-            try:
-                from metal_aac.core.metal_bridge import MetalHuffman
-                metal_ctx = MetalHuffman.shared()
-                rdb_list = metal_ctx.encode_adts_frames(
-                    q, sf, gg, window_seqs, config.sample_rate
+            # ISO path: sf are already ISO convention, use _iso encoder
+            for i in range(len(q)):
+                rdb = encode_raw_data_block_iso(
+                    q[i], sf[i], int(gg[i]),
+                    window_sequence=int(window_seqs[i]),
+                    sample_rate=config.sample_rate,
                 )
-                for rdb in rdb_list:
-                    writer.write_frame(rdb)
-            except (OSError, RuntimeError, FileNotFoundError):
-                _encode_adts_frames(writer, q, sf, gg, window_seqs, config)
+                writer.write_frame(rdb)
         else:
             try:
                 from metal_aac.core.metal_bridge import MetalHuffman
