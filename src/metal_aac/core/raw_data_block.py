@@ -28,30 +28,35 @@ from metal_aac.tables.scalefactor_bands import get_sfb_offsets
 
 
 class BitWriter:
-    """Accumulate bits and flush to bytes."""
+    """Accumulate bits into a Python bigint, flush to bytes at the end.
+
+    Using a single bigint avoids per-byte boundary checks in the hot loop.
+    Python's arbitrary-precision int shift/OR is implemented in C and is
+    significantly faster than per-write byte flushing.
+    """
+
+    __slots__ = ('_acc', '_nbits')
 
     def __init__(self):
-        self._buffer = 0
-        self._bits = 0
-        self._bytes = bytearray()
+        self._acc = 0
+        self._nbits = 0
 
     def write(self, value: int, n_bits: int) -> None:
-        self._buffer = (self._buffer << n_bits) | (value & ((1 << n_bits) - 1))
-        self._bits += n_bits
-        while self._bits >= 8:
-            self._bits -= 8
-            self._bytes.append((self._buffer >> self._bits) & 0xFF)
+        self._acc = (self._acc << n_bits) | (value & ((1 << n_bits) - 1))
+        self._nbits += n_bits
 
     def flush(self) -> bytes:
-        if self._bits > 0:
-            self._bytes.append((self._buffer << (8 - self._bits)) & 0xFF)
-            self._bits = 0
-            self._buffer = 0
-        return bytes(self._bytes)
+        n = self._nbits
+        if n == 0:
+            return b''
+        pad = (8 - n % 8) % 8
+        acc = self._acc << pad
+        total_bytes = (n + pad) // 8
+        return acc.to_bytes(total_bytes, 'big')
 
     @property
     def bits_written(self) -> int:
-        return len(self._bytes) * 8 + self._bits
+        return self._nbits
 
 
 def _compute_sections(
@@ -262,6 +267,10 @@ def encode_raw_data_block(
     bw.write(0, 1)  # gain_control_data_present = 0
 
     # ---- spectral_data ----
+    # Pre-convert to Python ints once (avoids repeated numpy-to-Python conversion)
+    q_list = quantized.tolist() if hasattr(quantized, 'tolist') else list(quantized)
+    n_coeffs = len(q_list)
+
     for start_sfb, end_sfb, cb in sections:
         if cb == ZERO_HCB:
             continue
@@ -271,16 +280,19 @@ def encode_raw_data_block(
             continue
 
         lo = sfb_offsets[start_sfb]
-        hi = sfb_offsets[end_sfb]
+        hi = min(sfb_offsets[end_sfb], n_coeffs)
 
         if codebook.dimension == 4:
             for i in range(lo, hi, 4):
-                vals = [int(quantized[j]) if j < len(quantized) else 0 for j in range(i, i + 4)]
-                _encode_spectral_quad(bw, cb, *vals)
+                v0 = q_list[i] if i < n_coeffs else 0
+                v1 = q_list[i+1] if i+1 < n_coeffs else 0
+                v2 = q_list[i+2] if i+2 < n_coeffs else 0
+                v3 = q_list[i+3] if i+3 < n_coeffs else 0
+                _encode_spectral_quad(bw, cb, v0, v1, v2, v3)
         else:
             for i in range(lo, hi, 2):
-                v0 = int(quantized[i]) if i < len(quantized) else 0
-                v1 = int(quantized[i + 1]) if i + 1 < len(quantized) else 0
+                v0 = q_list[i] if i < n_coeffs else 0
+                v1 = q_list[i+1] if i+1 < n_coeffs else 0
                 _encode_spectral_pair(bw, cb, v0, v1)
 
     # ID_END element

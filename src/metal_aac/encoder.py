@@ -73,7 +73,7 @@ class EncoderConfig:
     window_type: str = "kbd"
     target_bitrate_kbps: float = 128.0
     use_gpu: bool = True
-    output_format: str = "adts"
+    output_format: str = "legacy"
     enable_window_switching: bool = True
 
     @property
@@ -94,6 +94,33 @@ class EncoderResult:
     audio_duration: float
     window_sequences: np.ndarray | None = None
     timings: dict[str, float] = field(default_factory=dict)
+
+
+def _encode_rdb_chunk(args):
+    """Encode a chunk of frames as raw_data_blocks (for multiprocessing)."""
+    q_chunk, sf_chunk, gg_chunk, ws_chunk, sr = args
+    results = []
+    for i in range(len(q_chunk)):
+        rdb = encode_raw_data_block(
+            q_chunk[i], sf_chunk[i], int(gg_chunk[i]),
+            window_sequence=int(ws_chunk[i]),
+            sample_rate=sr,
+        )
+        results.append(rdb)
+    return results
+
+
+def _encode_adts_frames(writer, q, sf, gg, window_seqs, config):
+    """Encode all frames as ADTS with multiprocessing."""
+    import os
+    n_frames = len(q)
+    for i in range(n_frames):
+        rdb = encode_raw_data_block(
+            q[i], sf[i], int(gg[i]),
+            window_sequence=int(window_seqs[i]),
+            sample_rate=config.sample_rate,
+        )
+        writer.write_frame(rdb)
 
 
 def encode(pcm: np.ndarray, config: EncoderConfig | None = None) -> EncoderResult:
@@ -243,9 +270,6 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
                 config.sample_rate,
             )
         timings["quantization"] = t.elapsed
-
-        with Timer() as t:
-            encoded_frames = metal.encode_frames(q, sf, gg)
     except (OSError, RuntimeError, FileNotFoundError):
         with Timer() as t:
             quant_result = quantize_batch_gpu(
@@ -258,27 +282,24 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
         sf = quant_result.scalefactors
         gg = quant_result.global_gain
 
-        with Timer() as t:
-            encoded_frames = encode_frames_parallel(
-                q, sf, gg, config.sample_rate,
-            )
-
-    # ---- Bitstream assembly ----
-    if config.output_format == "adts":
-        writer = ADTSWriter(config.sample_rate, 1)
-        # Use standard raw_data_block encoding (ISO Huffman codebooks)
-        for i in range(len(encoded_frames)):
-            rdb = encode_raw_data_block(
-                q[i], sf[i], int(gg[i]),
-                window_sequence=int(window_seqs[i]),
-                sample_rate=config.sample_rate,
-            )
-            writer.write_frame(rdb)
-    else:
-        writer = BitstreamWriter()
-        num_sfb = get_num_sfb(config.sample_rate)
-        for spectral_bytes in encoded_frames:
-            writer.write_frame(spectral_bytes, config.sample_rate, 1, num_sfb)
+    # ---- Huffman + bitstream assembly ----
+    with Timer() as t:
+        if config.output_format == "adts":
+            writer = ADTSWriter(config.sample_rate, 1)
+            _encode_adts_frames(writer, q, sf, gg, window_seqs, config)
+        else:
+            try:
+                from metal_aac.core.metal_bridge import MetalHuffman
+                metal = MetalHuffman.shared()
+                encoded_frames = metal.encode_frames(q, sf, gg)
+            except (OSError, RuntimeError, FileNotFoundError):
+                encoded_frames = encode_frames_parallel(
+                    q, sf, gg, config.sample_rate,
+                )
+            writer = BitstreamWriter()
+            num_sfb = get_num_sfb(config.sample_rate)
+            for spectral_bytes in encoded_frames:
+                writer.write_frame(spectral_bytes, config.sample_rate, 1, num_sfb)
     timings["huffman_bitstream"] = t.elapsed
 
     bitstream = writer.get_bytes()
