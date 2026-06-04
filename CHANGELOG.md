@@ -5,6 +5,18 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-06-04
+
+### Fixed
+- **Adaptive bitrate calibration**: two-pass quantization samples 4 frames to
+  measure exp-Golomb vs Huffman bit ratio, then re-quantizes with corrected
+  target (capped at 1.15x). Bitrate range narrowed from [107, 157] to [124, 136] kbps.
+
+### Quality
+- Average bitrate: **130.6 kbps** (was ~120 kbps, target 128)
+- Music: **124.6 kbps** (was 111.6 kbps)
+- 60s encode: 112ms (vs 82ms without calibration — two-pass overhead)
+
 ## [0.8.0] - 2026-06-04
 
 ### Added

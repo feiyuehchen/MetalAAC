@@ -276,18 +276,35 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
 
     # ---- Quantization ----
     if config.output_format == "adts":
-        # ISO-native quantizer: sf is the only parameter per band.
-        # No mapping needed — sf goes directly to ADTS bitstream.
         with Timer() as t:
+            target = config.target_bits_per_frame
             quant_result = quantize_batch_gpu(
-                mdct_mx, masking_mx,
-                config.target_bits_per_frame,
-                config.sample_rate,
+                mdct_mx, masking_mx, target, config.sample_rate,
             )
+            # Adaptive calibration: measure actual Huffman bits on a sample
+            # of frames, then re-quantize with corrected target if needed.
+            B = quant_result.quantized.shape[0]
+            sample_idx = list(range(0, B, max(1, B // 4)))[:4]
+            est_total = sum(int(quant_result.total_bits[i]) for i in sample_idx)
+            actual_total = 0
+            for i in sample_idx:
+                rdb = encode_raw_data_block_iso(
+                    quant_result.quantized[i], quant_result.scalefactors[i],
+                    int(quant_result.global_gain[i]), sample_rate=config.sample_rate,
+                )
+                actual_total += len(rdb) * 8
+            if est_total > 0:
+                ratio = actual_total / est_total
+                correction = min(1.0 / ratio, 1.15)
+                corrected_target = int(target * correction)
+                if corrected_target > target * 1.03:
+                    quant_result = quantize_batch_gpu(
+                        mdct_mx, masking_mx, corrected_target, config.sample_rate,
+                    )
         timings["quantization"] = t.elapsed
         q = quant_result.quantized
-        sf = quant_result.scalefactors   # direct ISO sf values (100-255)
-        gg = quant_result.global_gain    # mean of ISO SFs for DPCM anchor
+        sf = quant_result.scalefactors
+        gg = quant_result.global_gain
     else:
         # Legacy quantizer for internal round-trip
         try:
