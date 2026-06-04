@@ -5,6 +5,58 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-03
+
+### Fixed
+- **ISO scalefactor calibration**: encode → ffmpeg decode now reconstructs correct
+  amplitude (ratio 0.95-0.99x). Formula: `iso_sf = 157 - (gg - sf_int*4) / 3`,
+  accounting for ffmpeg's POW_SF2_ZERO=200 and MDCT normalization mismatch.
+- DPCM prev_sf tracking: was tracking intended value instead of decoder's clamped
+  state, causing cascading SF errors when diff exceeded ±60.
+- Metal/Python integer division mismatch: added rounding in Metal to match Python.
+- Escape coding off-by-one: `(count+5)` → `(count+4)` per ISO 14496-3 4.6.3.3.
+- CPU ADTS path now uses `encode_raw_data_block` (was using legacy exp-Golomb).
+- Short window `sect_esc_val` corrected to 7 with 3-bit increments (was 31/5-bit).
+
+### Added
+- max |q| ≤ 255 constraint in Metal quantization binary search (parallel max-abs
+  reduction alongside bit sum).
+
+### Quality
+- 440 Hz sine: **SNR = 13.3 dB**, amplitude ratio = 0.99x
+- 1 kHz sine: **SNR = 13.1 dB**, amplitude ratio = 0.95x
+- Multi-tone: **SNR = 7.0 dB**, amplitude ratio = 0.90x
+
+## [0.3.0] - 2026-06-03
+
+### Added
+- **ISO/IEC 14496-3 Huffman codebooks**: all 11 spectral codebooks + scalefactor
+  codebook, exact values from ffmpeg libavcodec/aactab.c.
+- **Metal `kernel_encode_raw_data_block`**: writes complete ISO-compliant SCE
+  (ics_info + section_data + SF_data + spectral_data + ID_END) on GPU. Codebook
+  LUTs (~10KB) in Metal constant memory.
+- **`raw_data_block.py`**: Python reference implementation of ISO raw_data_block
+  encoder with BitWriter (bigint accumulation).
+- **ADTS bitstream format**: 7-byte fixed header (0xFFF sync, MPEG-2, LC profile).
+  Decoder auto-detects ADTS vs legacy format.
+- **Window switching**: transient detection (energy ratio, CPU + MLX GPU) + 4-state
+  window sequence machine (ONLY_LONG / LONG_START / EIGHT_SHORT / LONG_STOP).
+- **Short-window MDCT**: 8×256-pt via MLX batch matmul reshape `(B,2048)→(B*8,256)`.
+- **Transition window shapes**: long-start and long-stop per ISO 11.2.1.
+- **Short-window SFB tables**: 44100/48000/32000 Hz (128 MDCT lines).
+- **Performance regression tests**: 12 tests with per-stage timing thresholds.
+- **Pipeline restructure**: psychoacoustic runs parallel from raw PCM (transient
+  detection pre-MDCT, masking post-MDCT), matching ISO encoder block diagram.
+
+### Performance
+- ADTS encode 60s: **39ms** (all GPU) — parity with legacy Metal path (40ms)
+- Metal ISO Huffman: 400ms Python → 9ms Metal (**44x speedup**)
+
+### Changed
+- Default `output_format` remains `"legacy"` (ADTS opt-in via config) until
+  two-loop quantizer improves decoded quality.
+- ADTS header `id` bit set to 1 (MPEG-2) to match afconvert convention.
+
 ## [0.2.0] - 2026-06-03
 
 ### Added
@@ -36,7 +88,6 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 - Metal Huffman: 70-886x speedup over Python bit-packing
 - Metal quantization: 23x speedup over MLX (eliminates `mx.eval()` overhead)
 - Pipeline balanced: no single stage exceeds 30% of total time
-- Results: BENCHMARK.md, "End-to-End Encoder: Full Optimization History"
 
 ## [0.1.0] - 2026-06-03
 
