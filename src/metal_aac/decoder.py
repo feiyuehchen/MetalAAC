@@ -21,6 +21,7 @@ try:
 except ImportError:
     HAS_MLX = False
 
+from metal_aac.core.adts import ADTSReader
 from metal_aac.core.bitstream import INDEX_TO_SAMPLE_RATE, BitstreamReader
 from metal_aac.core.huffman import decode_frames_metal, decode_spectral_data
 from metal_aac.core.mdct import (
@@ -69,15 +70,42 @@ def decode(
     return _decode_cpu(bitstream, config)
 
 
+def _is_adts(data: bytes) -> bool:
+    return len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xF0) == 0xF0
+
+
+def _parse_frames(bitstream: bytes) -> tuple[list[tuple], int, int]:
+    """Parse bitstream (auto-detect ADTS vs legacy).
+
+    Returns: (frame_list, sample_rate, num_sfb)
+    Each frame is (payload_bytes,).
+    """
+    if _is_adts(bitstream):
+        reader = ADTSReader(bitstream)
+        raw_frames = reader.read_all_frames()
+        if not raw_frames:
+            return [], 44100, 49
+        sr = raw_frames[0][0]["sample_rate"]
+        from metal_aac.tables.scalefactor_bands import get_num_sfb
+        num_sfb = get_num_sfb(sr)
+        return [(payload,) for _, payload in raw_frames], sr, num_sfb
+    else:
+        reader = BitstreamReader(bitstream)
+        raw_frames = reader.read_all_frames()
+        if not raw_frames:
+            return [], 44100, 49
+        header = raw_frames[0][0]
+        sr = INDEX_TO_SAMPLE_RATE.get(header.sample_rate_index, 44100)
+        return [(payload,) for _, payload in raw_frames], sr, header.num_sfb
+
+
 def _decode_cpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
     timings = {}
 
-    # Parse bitstream + Huffman decode (CPU, sequential)
     with Timer() as t:
-        reader = BitstreamReader(bitstream)
-        raw_frames = reader.read_all_frames()
+        parsed_frames, sample_rate, num_sfb = _parse_frames(bitstream)
 
-        if not raw_frames:
+        if not parsed_frames:
             return DecoderResult(
                 pcm=np.array([], dtype=np.float32),
                 sample_rate=44100,
@@ -85,11 +113,8 @@ def _decode_cpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
                 timings=timings,
             )
 
-        header = raw_frames[0][0]
-        sample_rate = INDEX_TO_SAMPLE_RATE.get(header.sample_rate_index, 44100)
-
         decoded_frames = []
-        for hdr, payload in raw_frames:
+        for (payload,) in parsed_frames:
             quantized, scalefactors, global_gain = decode_spectral_data(
                 payload, sample_rate
             )
@@ -99,15 +124,14 @@ def _decode_cpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
     num_frames = len(decoded_frames)
     n_coeffs = config.frame_size // 2
 
-    # Dequantize
     with Timer() as t:
         all_quantized = np.zeros((num_frames, n_coeffs), dtype=np.int32)
-        all_sf = np.zeros((num_frames, header.num_sfb), dtype=np.int32)
+        all_sf = np.zeros((num_frames, num_sfb), dtype=np.int32)
         all_gain = np.zeros(num_frames, dtype=np.int32)
 
         for i, (q, sf, g) in enumerate(decoded_frames):
             all_quantized[i, : len(q)] = q[:n_coeffs]
-            all_sf[i, : len(sf)] = sf[: header.num_sfb]
+            all_sf[i, : len(sf)] = sf[:num_sfb]
             all_gain[i] = g
 
         mdct_coeffs = dequantize_cpu(all_quantized, all_sf, all_gain, sample_rate)
@@ -138,12 +162,10 @@ def _decode_cpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
 def _decode_gpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
     timings = {}
 
-    # Parse bitstream headers (CPU) + Huffman decode (Metal GPU or CPU fallback)
     with Timer() as t:
-        reader = BitstreamReader(bitstream)
-        raw_frames = reader.read_all_frames()
+        parsed_frames, sample_rate, num_sfb = _parse_frames(bitstream)
 
-        if not raw_frames:
+        if not parsed_frames:
             return DecoderResult(
                 pcm=np.array([], dtype=np.float32),
                 sample_rate=44100,
@@ -151,18 +173,16 @@ def _decode_gpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
                 timings=timings,
             )
 
-        header = raw_frames[0][0]
-        sample_rate = INDEX_TO_SAMPLE_RATE.get(header.sample_rate_index, 44100)
         n_coeffs = config.frame_size // 2
 
         try:
-            payloads = [payload for _, payload in raw_frames]
+            payloads = [p for (p,) in parsed_frames]
             all_quantized, all_sf, all_gain = decode_frames_metal(
-                payloads, n_coeffs, header.num_sfb
+                payloads, n_coeffs, num_sfb
             )
         except (OSError, RuntimeError, FileNotFoundError):
             decoded_frames = []
-            for hdr, payload in raw_frames:
+            for (payload,) in parsed_frames:
                 quantized, scalefactors, global_gain = decode_spectral_data(
                     payload, sample_rate
                 )
@@ -173,11 +193,11 @@ def _decode_gpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
             all_gain = np.zeros(len(decoded_frames), dtype=np.int32)
             for i, (q, sf, g) in enumerate(decoded_frames):
                 all_quantized[i, : len(q)] = q[:n_coeffs]
-                all_sf[i, : len(sf)] = sf[: header.num_sfb]
+                all_sf[i, : len(sf)] = sf[:num_sfb]
                 all_gain[i] = g
     timings["huffman_bitstream"] = t.elapsed
 
-    num_frames = len(raw_frames)
+    num_frames = len(parsed_frames)
     n_coeffs = config.frame_size // 2
     sfb_offsets = get_sfb_offsets(sample_rate)
 
