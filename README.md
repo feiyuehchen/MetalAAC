@@ -10,7 +10,7 @@ GPU-accelerated AAC-LC encoder/decoder for Apple Silicon.
 | Duration | MetalAAC | Apple afconvert | ffmpeg aac | vs Apple |
 |----------|----------|-----------------|------------|----------|
 | 10s | **36 ms** | 44 ms | 138 ms | 1.2x |
-| 60s | **46 ms** | 157 ms | 390 ms | **3.4x** |
+| 60s | **48 ms** | 158 ms | 390 ms | **3.3x** |
 | 300s | **169 ms** | 707 ms | 1764 ms | **4.2x** |
 
 ### Decode Speed (60s mono)
@@ -18,7 +18,6 @@ GPU-accelerated AAC-LC encoder/decoder for Apple Silicon.
 | Decoder | Time | vs ffmpeg |
 |---------|------|----------|
 | MetalAAC GPU | **56 ms** | **2.1x faster** |
-| MetalAAC CPU | 59 ms | 2.0x faster |
 | ffmpeg | 117 ms | baseline |
 
 ### Quality (ADTS, ffmpeg decode)
@@ -158,30 +157,29 @@ python scripts/compare_all_encoders.py --durations 60
 
 ## Architecture
 
+Backend is auto-detected at startup (`has_metal()`). Each encode/decode uses
+one consistent path — no mixed Metal/MLX within a single call.
+
 ```
-Encoder (46ms for 60s mono):
-  PCM → Frame → MDCT → Quantize → Huffman → ADTS
-        MLX     MLX     Metal      Metal
-        3ms     27ms    9ms        15ms
+Metal path (primary, Apple Silicon + dylib):
+  Encode: PCM → Frame(MLX) → MDCT(MLX) → Quantize(Metal) → Huffman(Metal) → ADTS
+  Decode: ADTS → Huffman(C+GCD) → Dequant(MLX) → IMDCT(MLX) → PCM
 
-Decoder (56ms for 60s mono):
-  ADTS → Huffman → Dequant → IMDCT → PCM
-         C+GCD     MLX       MLX
-         ~0ms*     9ms       19ms
-
-  * Huffman timing included in bitstream parsing overhead (24ms total)
+MLX fallback (no dylib built):
+  Encode: PCM → Frame(MLX) → MDCT(MLX) → Quantize(MLX) → Huffman(Python) → ADTS
+  Decode: ADTS → Huffman(Python LUT) → Dequant(NumPy) → IMDCT(CPU) → PCM
 ```
 
-### Pipeline Stages (60s mono)
+### Pipeline Stages (60s mono, Metal path)
 
 | Encode Stage | Time | Accelerator |
 |-------------|------|-------------|
-| Framing | 3 ms | MLX GPU |
-| Transient detect | 4 ms | MLX GPU |
-| MDCT | 27 ms | MLX GPU (matmul) |
-| Psychoacoustic | 3 ms | MLX GPU (FFT) |
-| Quantization | 9 ms | Metal GPU (binary search) |
-| Huffman + ADTS | 15 ms | Metal GPU |
+| Framing | 8 ms | MLX GPU |
+| Transient detect | 6 ms | MLX GPU |
+| MDCT | 33 ms | MLX GPU (matmul) |
+| Psychoacoustic | 6 ms | MLX GPU (FFT) |
+| Quantization | 21 ms | Metal GPU (binary search) |
+| Huffman + ADTS | 18 ms | Metal GPU |
 
 | Decode Stage | Time | Accelerator |
 |-------------|------|-------------|
@@ -224,7 +222,8 @@ MetalAAC/
 | v0.2.0 | 33 ms | 5x faster | Metal GPU (legacy format) |
 | v0.7.0 | 314 ms | 2x slower | ISO ADTS + rate allocation |
 | v0.11.0 | 320 ms | 2x slower | Single-pass quantization |
-| **v0.12.0** | **46 ms** | **3.4x faster** | **Metal ISO quantizer** |
+| v0.12.0 | 46 ms | 3.4x faster | Metal ISO quantizer |
+| **v0.13.1** | **48 ms** | **3.3x faster** | **Short windows + unified backend** |
 
 ## License
 

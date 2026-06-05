@@ -5,6 +5,20 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-06-05
+
+### Fixed
+- **5 boundary handling bugs** from code review:
+  - `encode_cpe_iso` short window used long SFB table (same as SCE bug, now fixed)
+  - ADTS `frame_length` 13-bit overflow guard (max 8191 bytes)
+  - Python/C escape decoding capped at count≤24 (prevents unbounded loop/UB)
+  - C decoder SF beyond max_sfb fills 0 (matches Python behavior)
+
+### Changed
+- **Unified backend selection**: `has_metal()`/`metal()` in metal_bridge.py for
+  one-time detection. Replaced all scattered try/except with single check.
+  Each encode/decode uses ONE consistent path (Metal or MLX, never mixed).
+
 ## [0.13.0] - 2026-06-05
 
 ### Added
