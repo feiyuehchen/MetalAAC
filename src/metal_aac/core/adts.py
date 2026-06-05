@@ -47,6 +47,7 @@ def write_adts_header(
     sample_rate: int = 44100,
     channel_config: int = 1,
     profile: int = PROFILE_LC,
+    buffer_fullness: int = 0,
 ) -> bytes:
     """Build a 7-byte ADTS fixed header (no CRC).
 
@@ -70,7 +71,7 @@ def write_adts_header(
     b4 = (frame_length >> 3) & 0xFF
 
     # Byte 5: frame_length_lo(3) + buffer_fullness_hi(5)
-    buffer_fullness = 0  # 0 = CBR (matches afconvert convention)
+    buffer_fullness = buffer_fullness & 0x7FF
     b5 = ((frame_length & 0x7) << 5) | ((buffer_fullness >> 6) & 0x1F)
 
     # Byte 6: buffer_fullness_lo(6) + num_raw_data_blocks(2)
@@ -120,11 +121,12 @@ class ADTSWriter:
         self._channel_config = num_channels
         self._num_frames = 0
 
-    def write_frame(self, raw_data_block: bytes) -> None:
+    def write_frame(self, raw_data_block: bytes, buffer_fullness: int = 0) -> None:
         header = write_adts_header(
             len(raw_data_block),
             self._sample_rate,
             self._channel_config,
+            buffer_fullness=buffer_fullness,
         )
         self._buffer.extend(header)
         self._buffer.extend(raw_data_block)

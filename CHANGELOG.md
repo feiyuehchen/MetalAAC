@@ -5,6 +5,21 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-04
+
+### Added
+- **M/S stereo coding**: per-SFB mid/side transform in MDCT domain. Uses M/S
+  when side energy < both L and R energy (correlated channels). Writes
+  `ms_mask_present` (0/1/2) and per-SFB `ms_used` flags in CPE bitstream.
+  ISO-compatible: `M=(L+R)/2, S=(L-R)/2`, decoder `L=M+S, R=M-S`.
+- **Bit reservoir**: tracks running surplus/deficit across frames. Writes correct
+  `buffer_fullness` in ADTS headers. Maximum 6144×nch bits (AAC-LC standard).
+
+### Quality (stereo, 128 kbps target, ffmpeg decode)
+- Correlated (L=R): **51.7 dB** SNR both channels (M/S: 100% SFBs, S≈0)
+- Uncorrelated (L=440Hz, R=1kHz): **51.6 / 50.7 dB** (M/S: 8% SFBs)
+- Both cases decodable by ffmpeg without errors
+
 ## [0.9.0] - 2026-06-04
 
 ### Added
