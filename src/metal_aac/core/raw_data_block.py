@@ -186,8 +186,20 @@ def encode_raw_data_block_iso(
     iso_scalefactors: (num_sfb,) int32 — direct ISO SF values (100-255)
     iso_global_gain: int — written directly as global_gain in ADTS header
     """
-    sfb_offsets = get_sfb_offsets(sample_rate)
-    num_sfb = len(sfb_offsets) - 1
+    if window_sequence == 2:
+        from metal_aac.tables.scalefactor_bands import get_sfb_offsets_short
+        short_sfb = get_sfb_offsets_short(sample_rate)
+        num_sfb_short = len(short_sfb) - 1
+        num_win = 8
+        sfb_offsets = [0]
+        for sb in range(num_sfb_short):
+            w = (short_sfb[sb + 1] - short_sfb[sb]) * num_win
+            sfb_offsets.append(sfb_offsets[-1] + w)
+        num_sfb = num_sfb_short
+    else:
+        sfb_offsets = get_sfb_offsets(sample_rate)
+        num_sfb = len(sfb_offsets) - 1
+
     quantized = np.clip(quantized, -255, 255)
     sections = _compute_sections(quantized, sfb_offsets)
 

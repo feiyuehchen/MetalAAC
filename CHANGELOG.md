@@ -5,6 +5,22 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-06-05
+
+### Added
+- **Proper short-window ADTS encoding**: EIGHT_SHORT_SEQUENCE frames now use the
+  correct 14-band short-window SFB table (128 MDCT lines × 8 groups). ISO
+  SFB-interleaved reordering maps 8×128 MDCT coefficients to the standard layout.
+- `reorder_short_to_iso()` / `reorder_iso_to_short()` for coefficient reordering.
+- `encode_raw_data_block_iso()` auto-selects short/long SFB table from window_sequence.
+- Metal `quantize_iso()` accepts `custom_sfb_offsets` for short-window frames.
+
+### Fixed
+- **Replaced v0.12.1 workaround** (disable short windows for ADTS) with proper
+  implementation. Short-window frames now write correct `max_sfb=14` in 4-bit field
+  and use `scale_factor_grouping=0x7F` (all 8 windows in one group).
+- 0 ffmpeg frame errors on all tested real audio (podcast, music).
+
 ## [0.12.1] - 2026-06-05
 
 ### Fixed
