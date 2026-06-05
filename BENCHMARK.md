@@ -234,48 +234,58 @@ Notes:
 - Noise signals (white/pink) have inherently low SNR since reconstruction of wideband
   noise requires extreme bit density.
 
-## v0.10.x Speed Comparison (M3 Pro, best of 3-5 runs)
+## v0.10.4 Speed Comparison (M3 Pro, 440 Hz sine, best of 5 runs)
 
-### Encoder Speed
+### Cross-Encoder Comparison (encode-only, 128 kbps mono)
 
-| Mode | 10s | 60s | 300s | RTF |
-|------|-----|-----|------|-----|
-| **Mono ADTS** | 86 ms | 346 ms | 1634 ms | 0.0054 |
-| **Stereo ADTS** | 482 ms | 2659 ms | — | 0.044 |
-| Apple afconvert (mono) | — | 29 ms | — | 0.0005 |
-| ffmpeg native aac (mono) | — | 407 ms | — | 0.0068 |
+| Encoder | 10s | 60s | 300s |
+|---------|-----|-----|------|
+| Apple afconvert | 43 ms | 158 ms | 720 ms |
+| **MetalAAC** | **78 ms** | **354 ms** | **1574 ms** |
+| ffmpeg native aac | 137 ms | 400 ms | 1817 ms |
 
-Notes:
-- Mono ADTS is ~12x slower than Apple afconvert. Bottleneck: 2-pass MLX quantization
-  (60%) + transient detection (24%). Legacy Metal path (v0.2.0) was 33ms/60s.
-- Stereo adds M/S transform + 2× quantization + Python CPE encoding loop.
-- ffmpeg native aac is comparable speed to MetalAAC mono.
+MetalAAC is 2.2x slower than Apple afconvert but faster than ffmpeg.
+Bottleneck: 2-pass MLX quantization (53%) + transient detection (28%).
 
-### Decoder Speed
+### Cross-Decoder Comparison (60s mono ADTS)
 
-| Mode | 10s | 60s | 300s | Bottleneck |
-|------|-----|-----|------|-----------|
-| **v0.10.1 Python** | 401 ms | 2386 ms | 12894 ms | Huffman 88% |
-| **v0.10.3 Native C** | — | 102 ms | — | dequant 45ms |
-| **v0.10.4 +MLX** | — | **57 ms** | **1756 ms** | imdct 20ms |
+| Decoder | 60s | Notes |
+|---------|-----|-------|
+| **MetalAAC** | **67 ms** | Native C+GCD + MLX GPU |
+| ffmpeg | 118 ms | Includes process startup |
 
-Notes:
-- 42x total speedup from v0.10.1 to v0.10.4.
-- Native C+GCD Huffman decode: ~0ms (LUT, multi-core parallel).
-- MLX GPU dequantization: 7ms (was 45ms numpy).
-- Remaining: IMDCT 20ms (MLX matmul), overlap-add 4ms (numpy).
+MetalAAC decode is **1.8x faster than ffmpeg** (including ffmpeg subprocess overhead).
+
+### Decode Optimization History
+
+| Version | Method | 60s | Speedup |
+|---------|--------|-----|---------|
+| v0.10.1 | Python bit-by-bit tree | 2386 ms | baseline |
+| v0.10.2 | Python LUT + vectorized numpy | 1391 ms | 1.7x |
+| v0.10.3 | Native C + GCD | 102 ms | 23x |
+| **v0.10.4** | **+ MLX dequant/IMDCT** | **57 ms** | **42x** |
 
 ### Encoder Stage Breakdown (60s mono ADTS)
 
-| Stage | Time (ms) | % |
-|-------|-----------|---|
-| Transient detect | 119 | 24% |
-| Framing | 3 | 1% |
-| MDCT | 26 | 5% |
-| Psychoacoustic | 6 | 1% |
-| Quantization (2-pass) | 302 | 60% |
-| Huffman + bitstream | 50 | 10% |
-| **Total** | **505** | |
+| Stage | Time (ms) | % | Accelerator |
+|-------|-----------|---|-------------|
+| Transient detect | 166 | 28% | MLX GPU |
+| Framing | 4 | 1% | MLX GPU |
+| MDCT | 41 | 7% | MLX GPU |
+| Psychoacoustic | 8 | 1% | MLX GPU |
+| Quantization (2-pass) | 309 | 53% | MLX GPU |
+| Huffman + ADTS | 55 | 9% | Metal GPU |
+| **Total** | **583** | |
+
+### Decoder Stage Breakdown (60s mono ADTS)
+
+| Stage | Time (ms) | Accelerator |
+|-------|-----------|-------------|
+| Huffman parse | ~0 | Native C + GCD |
+| Dequantize | 7 | MLX GPU |
+| IMDCT | 21 | MLX GPU |
+| Overlap-add | 4 | NumPy |
+| **Total** | **57** (GPU) / **61** (CPU) |
 
 ## Abandoned Directions
 
