@@ -62,6 +62,32 @@ int metal_encode_adts_frames(
     int32_t* frame_sizes
 );
 
+// Decode LUT entry: value index + code length
+typedef struct {
+    int16_t value;
+    int16_t length;
+} DecodeLUTEntry;
+
+int metal_decode_iso_frames(
+    const uint8_t* payloads,
+    const int32_t* payload_offsets,
+    int32_t B,
+    int32_t N,
+    int32_t num_sfb,
+    const int32_t* sfb_offsets,
+    const DecodeLUTEntry* spec_luts,
+    const int32_t* lut_offsets,
+    const int32_t* lut_max_bits,
+    const int32_t* cb_dims,
+    const int32_t* cb_signed,
+    const int32_t* cb_max_abs,
+    const DecodeLUTEntry* sf_lut,
+    int32_t sf_max_bits,
+    int32_t* quantized_out,
+    int32_t* scalefactors_out,
+    int32_t* global_gains_out
+);
+
 int metal_huffman_quantize(
     MetalHuffmanCtx* ctx,
     const float* mdct_coeffs,

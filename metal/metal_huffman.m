@@ -599,3 +599,224 @@ int metal_encode_adts_frames(MetalHuffmanCtx* ctx,
         return 0;
     }
 }
+
+// ---- Native ISO Huffman decoder (C with GCD parallelism) ----
+
+static inline uint32_t bits_peek(const uint8_t* data, int pos, int n, int total_bits) {
+    if (n <= 0) return 0;
+    int avail = total_bits - pos;
+    if (avail <= 0) return 0;
+    if (n > avail) n = avail;
+    uint32_t result = 0;
+    for (int i = 0; i < n; i++) {
+        int bp = pos + i;
+        result = (result << 1) | ((data[bp >> 3] >> (7 - (bp & 7))) & 1);
+    }
+    if (n < 32) {
+        // nothing to pad
+    }
+    return result;
+}
+
+static inline int bits_read(const uint8_t* data, int* pos, int n, int total_bits) {
+    uint32_t val = bits_peek(data, *pos, n, total_bits);
+    *pos += n;
+    return (int)val;
+}
+
+static inline int huff_decode(const uint8_t* data, int* pos, int total_bits,
+                               const DecodeLUTEntry* lut, int max_bits) {
+    int avail = total_bits - *pos;
+    if (avail <= 0) return -1;
+    int peek_bits = (avail < max_bits) ? avail : max_bits;
+    uint32_t prefix = bits_peek(data, *pos, peek_bits, total_bits);
+    if (peek_bits < max_bits) prefix <<= (max_bits - peek_bits);
+    DecodeLUTEntry e = lut[prefix];
+    if (e.value < 0) return -1;
+    *pos += e.length;
+    return e.value;
+}
+
+static void decode_one_frame(
+    const uint8_t* payload, int payload_bytes,
+    int N, int num_sfb, const int32_t* sfb_offsets,
+    const DecodeLUTEntry* spec_luts, const int32_t* lut_offsets,
+    const int32_t* lut_max_bits, const int32_t* cb_dims,
+    const int32_t* cb_signed, const int32_t* cb_max_abs,
+    const DecodeLUTEntry* sf_lut, int sf_max_bits,
+    int32_t* q_out, int32_t* sf_out, int32_t* gg_out)
+{
+    int total_bits = payload_bytes * 8;
+    int pos = 0;
+
+    int elem_id = bits_read(payload, &pos, 3, total_bits);
+    bits_read(payload, &pos, 4, total_bits); // tag
+
+    int global_gain = 0;
+    int window_seq = 0;
+    int max_sfb = 0;
+    int sect_esc = 31, sect_nbits = 5;
+
+    if (elem_id == 1) {
+        // CPE: common_window + ics_info + ms_mask
+        int cw = bits_read(payload, &pos, 1, total_bits);
+        if (cw) {
+            bits_read(payload, &pos, 1, total_bits); // reserved
+            window_seq = bits_read(payload, &pos, 2, total_bits);
+            bits_read(payload, &pos, 1, total_bits); // shape
+            if (window_seq == 2) {
+                max_sfb = bits_read(payload, &pos, 4, total_bits);
+                bits_read(payload, &pos, 7, total_bits);
+                sect_esc = 7; sect_nbits = 3;
+            } else {
+                max_sfb = bits_read(payload, &pos, 6, total_bits);
+                bits_read(payload, &pos, 1, total_bits);
+            }
+            int ms_mask = bits_read(payload, &pos, 2, total_bits);
+            if (ms_mask == 1) pos += (max_sfb < num_sfb ? max_sfb : num_sfb);
+        }
+        if (max_sfb > num_sfb) max_sfb = num_sfb;
+        // Decode channel 0
+        global_gain = bits_read(payload, &pos, 8, total_bits);
+    } else {
+        // SCE
+        global_gain = bits_read(payload, &pos, 8, total_bits);
+        bits_read(payload, &pos, 1, total_bits);
+        window_seq = bits_read(payload, &pos, 2, total_bits);
+        bits_read(payload, &pos, 1, total_bits);
+        if (window_seq == 2) {
+            max_sfb = bits_read(payload, &pos, 4, total_bits);
+            bits_read(payload, &pos, 7, total_bits);
+            sect_esc = 7; sect_nbits = 3;
+        } else {
+            max_sfb = bits_read(payload, &pos, 6, total_bits);
+            bits_read(payload, &pos, 1, total_bits);
+        }
+        if (max_sfb > num_sfb) max_sfb = num_sfb;
+    }
+
+    *gg_out = global_gain;
+
+    // section_data
+    int sfb_cb[64];
+    memset(sfb_cb, 0, sizeof(sfb_cb));
+    int sections[64][3]; // start, end, cb
+    int n_sections = 0;
+    int k = 0;
+    while (k < max_sfb && n_sections < 64) {
+        int cb = bits_read(payload, &pos, 4, total_bits);
+        int slen = 0;
+        while (1) {
+            int inc = bits_read(payload, &pos, sect_nbits, total_bits);
+            slen += inc;
+            if (inc < sect_esc) break;
+        }
+        int end = k + slen;
+        if (end > max_sfb) end = max_sfb;
+        sections[n_sections][0] = k;
+        sections[n_sections][1] = end;
+        sections[n_sections][2] = cb;
+        n_sections++;
+        for (int s = k; s < end && s < 64; s++) sfb_cb[s] = cb;
+        k = end;
+    }
+
+    // scale_factor_data
+    int prev_sf = global_gain;
+    for (int sb = 0; sb < max_sfb; sb++) {
+        if (sfb_cb[sb] == 0) { sf_out[sb] = prev_sf; continue; }
+        int idx = huff_decode(payload, &pos, total_bits, sf_lut, sf_max_bits);
+        if (idx < 0) { sf_out[sb] = prev_sf; continue; }
+        prev_sf += idx - 60;
+        sf_out[sb] = prev_sf;
+    }
+    for (int sb = max_sfb; sb < num_sfb; sb++) sf_out[sb] = prev_sf;
+
+    // pulse/tns/gain
+    pos += 3;
+
+    // spectral_data
+    memset(q_out, 0, N * sizeof(int32_t));
+    for (int si = 0; si < n_sections; si++) {
+        int cb = sections[si][2];
+        if (cb == 0 || cb < 1 || cb > 11) continue;
+        int dim = cb_dims[cb];
+        int is_signed = cb_signed[cb];
+        int mabs = cb_max_abs[cb];
+        int dim_size = is_signed ? (2*mabs+1) : (mabs+1);
+        int offset = is_signed ? mabs : 0;
+        const DecodeLUTEntry* lut = spec_luts + lut_offsets[cb];
+        int mbits = lut_max_bits[cb];
+        int lo = sfb_offsets[sections[si][0]];
+        int hi = sfb_offsets[sections[si][1]];
+        if (hi > N) hi = N;
+
+        for (int i = lo; i < hi; i += dim) {
+            int idx = huff_decode(payload, &pos, total_bits, lut, mbits);
+            if (idx < 0) break;
+
+            int vals[4];
+            int rem = idx;
+            for (int d = dim - 1; d >= 0; d--) {
+                vals[d] = (rem % dim_size) - offset;
+                rem /= dim_size;
+            }
+
+            if (!is_signed) {
+                for (int d = 0; d < dim; d++) {
+                    if (vals[d] > 0) {
+                        if (bits_read(payload, &pos, 1, total_bits)) vals[d] = -vals[d];
+                    }
+                }
+                if (cb == 11) {
+                    for (int d = 0; d < dim; d++) {
+                        int av = vals[d] < 0 ? -vals[d] : vals[d];
+                        if (av >= 16) {
+                            int sign = vals[d] < 0 ? -1 : 1;
+                            int cnt = 0;
+                            while (bits_read(payload, &pos, 1, total_bits) == 1) cnt++;
+                            int esc_val = (1 << (cnt + 4)) | bits_read(payload, &pos, cnt + 4, total_bits);
+                            vals[d] = sign * esc_val;
+                        }
+                    }
+                }
+            }
+
+            for (int d = 0; d < dim && (i+d) < N; d++) q_out[i+d] = vals[d];
+        }
+    }
+}
+
+int metal_decode_iso_frames(
+    const uint8_t* payloads,
+    const int32_t* payload_offsets,
+    int32_t B, int32_t N, int32_t num_sfb,
+    const int32_t* sfb_offsets,
+    const DecodeLUTEntry* spec_luts,
+    const int32_t* lut_offsets,
+    const int32_t* lut_max_bits,
+    const int32_t* cb_dims,
+    const int32_t* cb_signed,
+    const int32_t* cb_max_abs,
+    const DecodeLUTEntry* sf_lut,
+    int32_t sf_max_bits,
+    int32_t* quantized_out,
+    int32_t* scalefactors_out,
+    int32_t* global_gains_out)
+{
+    dispatch_apply((size_t)B, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+        ^(size_t b) {
+            int offset = payload_offsets[b];
+            int len = payload_offsets[b+1] - offset;
+            decode_one_frame(
+                payloads + offset, len,
+                N, num_sfb, sfb_offsets,
+                spec_luts, lut_offsets, lut_max_bits,
+                cb_dims, cb_signed, cb_max_abs,
+                sf_lut, sf_max_bits,
+                quantized_out + b * N,
+                scalefactors_out + b * num_sfb,
+                global_gains_out + b);
+        });
+    return 0;
+}

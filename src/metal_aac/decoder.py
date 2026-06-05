@@ -223,18 +223,35 @@ def _decode_cpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
                 num_frames=len(parsed_frames), timings=timings,
             )
 
-        decoded_frames = []
-        for (payload,) in parsed_frames:
-            if is_adts:
-                quantized, scalefactors, global_gain = decode_raw_data_block_iso(
-                    payload, sample_rate
+        if is_adts:
+            try:
+                from metal_aac.core.metal_bridge import MetalHuffman
+                metal = MetalHuffman.shared()
+                payloads = [p for (p,) in parsed_frames]
+                all_q, all_sf, all_gg = metal.decode_iso_frames(
+                    payloads, sample_rate, config.frame_size // 2
                 )
-            else:
+                timings["huffman_bitstream"] = t.elapsed
+                decoded_frames = [
+                    (all_q[i], all_sf[i], int(all_gg[i]))
+                    for i in range(len(payloads))
+                ]
+            except (OSError, RuntimeError, FileNotFoundError):
+                decoded_frames = []
+                for (payload,) in parsed_frames:
+                    quantized, scalefactors, global_gain = decode_raw_data_block_iso(
+                        payload, sample_rate
+                    )
+                    decoded_frames.append((quantized, scalefactors, global_gain))
+                timings["huffman_bitstream"] = t.elapsed
+        else:
+            decoded_frames = []
+            for (payload,) in parsed_frames:
                 quantized, scalefactors, global_gain = decode_spectral_data(
                     payload, sample_rate
                 )
-            decoded_frames.append((quantized, scalefactors, global_gain))
-    timings["huffman_bitstream"] = t.elapsed
+                decoded_frames.append((quantized, scalefactors, global_gain))
+            timings["huffman_bitstream"] = t.elapsed
 
     pcm = _decode_channel(decoded_frames, num_sfb, config, sample_rate, is_adts, timings)
 
@@ -278,19 +295,27 @@ def _decode_gpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
                                 num_frames=len(parsed_frames), timings=timings)
 
         if is_adts:
-            decoded_frames = []
-            for (payload,) in parsed_frames:
-                quantized, scalefactors, global_gain = decode_raw_data_block_iso(
-                    payload, sample_rate
+            try:
+                from metal_aac.core.metal_bridge import MetalHuffman
+                metal = MetalHuffman.shared()
+                payloads = [p for (p,) in parsed_frames]
+                all_quantized, all_sf, all_gain = metal.decode_iso_frames(
+                    payloads, sample_rate, n_coeffs
                 )
-                decoded_frames.append((quantized, scalefactors, global_gain))
-            all_quantized = np.zeros((len(decoded_frames), n_coeffs), dtype=np.int32)
-            all_sf = np.zeros((len(decoded_frames), num_sfb), dtype=np.int32)
-            all_gain = np.zeros(len(decoded_frames), dtype=np.int32)
-            for i, (q, sf, g) in enumerate(decoded_frames):
-                all_quantized[i, : len(q)] = q[:n_coeffs]
-                all_sf[i, : len(sf)] = sf[:num_sfb]
-                all_gain[i] = g
+            except (OSError, RuntimeError, FileNotFoundError):
+                decoded_frames = []
+                for (payload,) in parsed_frames:
+                    quantized, scalefactors, global_gain = decode_raw_data_block_iso(
+                        payload, sample_rate
+                    )
+                    decoded_frames.append((quantized, scalefactors, global_gain))
+                all_quantized = np.zeros((len(decoded_frames), n_coeffs), dtype=np.int32)
+                all_sf = np.zeros((len(decoded_frames), num_sfb), dtype=np.int32)
+                all_gain = np.zeros(len(decoded_frames), dtype=np.int32)
+                for i, (q, sf, g) in enumerate(decoded_frames):
+                    all_quantized[i, :len(q)] = q[:n_coeffs]
+                    all_sf[i, :len(sf)] = sf[:num_sfb]
+                    all_gain[i] = g
         else:
             try:
                 payloads = [p for (p,) in parsed_frames]
