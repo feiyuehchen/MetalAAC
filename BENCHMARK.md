@@ -98,194 +98,84 @@ def measure_peak_memory(func: Callable, *args) -> tuple[float, Any]
 
 ---
 
-# Part B -- Results (accumulating; updated every run)
+# Part B — Results (v0.12.0, M3 Pro, best of 5 runs)
 
-## v0.1.x Results (current metric definitions)
+## Cross-Encoder Comparison (encode-only, 128 kbps mono)
 
-### Per-Stage GPU Speedup (Apple M3 Pro, MLX 0.31.2, 50 runs, mean ± std)
+| Duration | MetalAAC | Apple afconvert | ffmpeg aac | vs Apple |
+|----------|----------|-----------------|------------|----------|
+| 10s | **36 ms** | 44 ms | 138 ms | 1.2x |
+| 60s | **46 ms** | 157 ms | 390 ms | **3.4x** |
+| 300s | **169 ms** | 707 ms | 1764 ms | **4.2x** |
 
-| Duration | Frames | MDCT CPU (ms) | MDCT GPU (ms) | MDCT Speedup | Psycho CPU (ms) | Psycho GPU (ms) | Psycho Speedup | IMDCT CPU (ms) | IMDCT GPU (ms) | IMDCT Speedup |
-|----------|--------|---------------|---------------|--------------|-----------------|-----------------|----------------|----------------|----------------|---------------|
-| 10s | 431 | 1.24 ± 0.09 | 1.04 ± 0.52 | 1.19x | 3.42 ± 0.36 | 0.73 ± 0.28 | 4.71x | 1.47 ± 0.09 | 0.81 ± 0.44 | 1.82x |
-| 60s | 2,584 | 8.21 ± 0.21 | 2.57 ± 0.72 | 3.20x | 22.38 ± 1.22 | 1.92 ± 0.47 | 11.68x | 8.68 ± 1.90 | 2.55 ± 0.52 | 3.40x |
-| 300s | 12,920 | 38.52 ± 1.60 | 10.66 ± 0.20 | 3.61x | 121.09 ± 4.41 | 6.88 ± 0.53 | 17.60x | 40.89 ± 2.66 | 10.78 ± 0.62 | 3.79x |
-| **3600s** | **155,040** | **491.16 ± 87.45** | **129.15 ± 22.04** | **3.80x** | **1899.46 ± 444.97** | **82.49 ± 2.60** | **23.03x** | **508.44 ± 72.12** | **123.87 ± 0.40** | **4.10x** |
+## Cross-Decoder Comparison (60s mono ADTS)
 
-### Apple AAC (afconvert) Throughput (50 runs, mean ± std)
+| Decoder | Time | vs ffmpeg |
+|---------|------|----------|
+| MetalAAC GPU | **56 ms** | **2.1x faster** |
+| MetalAAC CPU | 59 ms | 2.0x faster |
+| ffmpeg | 117 ms | baseline |
 
-| Duration | Apple Encode (ms) | Apple RTF |
-|----------|-------------------|-----------|
-| 10s | 38.6 ± 2.2 | 0.003865 |
-| 60s | 123.8 ± 2.9 | 0.002064 |
-| 300s | 527.7 ± 5.4 | 0.001759 |
-| 3600s | 6048.2 ± 61.3 | 0.001680 |
+## Quality (ADTS, ffmpeg decode, 128 kbps target)
 
-### End-to-End Quality (128 kbps target, CPU path)
+| Signal | SNR (dB) | Bitrate (kbps) |
+|--------|----------|----------------|
+| sine_440 | 53.4 | 107 |
+| sine_1k | 52.6 | 106 |
+| sine_4k | 51.0 | 115 |
+| multitone | 51.4 | 112 |
+| chirp | 51.8 | 109 |
+| white_noise | 10.2 | 134 |
+| pink_noise | 16.2 | 135 |
+| music_1min | 46.5 | 111 |
 
-| Signal | SNR (dB) | SC | Actual Bitrate (kbps) | Encoder RTF | Decoder RTF |
-|--------|----------|----|----------------------|-------------|-------------|
-| sine_440 (1s) | 19.9 | 0.0178 | 77.3 | 0.206 | 0.035 |
-| chirp (2s) | 24.0 | 0.0057 | 79.0 | 0.195 | 0.035 |
-| long_music (10s) | 25.2 | 0.0081 | 87.5 | 0.182 | 0.035 |
-| music_1min (60s) | 38.5 | 0.0037 | 91.5 | 0.150 | 0.035 |
-| music_5min (300s) | 44.0 | 0.0033 | 91.5 | 0.152 | 0.035 |
+## Stereo (M/S coding, 128 kbps target)
 
-### End-to-End Encoder: Full Optimization History
+| Signal | SNR L (dB) | SNR R (dB) | Bitrate (kbps) |
+|--------|-----------|-----------|----------------|
+| Correlated (L=R) | 51.5 | 51.5 | 52 |
+| Uncorrelated (440+1kHz) | 51.4 | 50.5 | 100 |
 
-| Duration | v1 CPU | v2 MLX GPU | v3 +Metal Huffman | v4 +Metal Quant | v5 +MLX Framing | Apple AAC | v5/Apple |
-|----------|--------|-----------|-------------------|-----------------|-----------------|-----------|----------|
-| 10s | 1.502s | 0.268s | 0.069s | 0.023s | **0.023s** | 0.042s | **1.9x faster** |
-| 60s | 8.869s | 0.512s | 0.176s | 0.038s | **0.033s** | 0.128s | **3.9x faster** |
-| 300s | 44.789s | 1.754s | 0.699s | 0.121s | **0.102s** | 0.529s | **5.2x faster** |
-
-### Pipeline Breakdown (v5 final, 300s, 12920 frames)
-
-| Stage | Time (ms) | % | Accelerator |
-|-------|-----------|---|-------------|
-| Framing | 7.1 | 7.0% | MLX GPU (gather indexing) |
-| MDCT | 29.1 | 28.5% | MLX GPU (batch matmul) |
-| Psychoacoustic | 8.0 | 7.8% | MLX GPU (batch FFT + matmul) |
-| Quantization | 21.4 | 21.0% | Metal GPU (binary search kernel) |
-| Huffman + bitstream | 30.1 | 29.5% | Metal GPU (4 compute kernels) |
-| **Total** | **102.0** | | |
-
-### Optimization Progression on Quantization Stage (300s)
-
-| Version | Method | Time (ms) | Bottleneck? |
-|---------|--------|-----------|-------------|
-| v2 | CPU Python per-frame loop | ~44,000 | Yes (99%) |
-| v3 | MLX batch GPU, 20 iterations | 518 | Yes (79%) |
-| v4a | MLX batch GPU, 8 iterations | 215 | Yes (63%) — 20 iter was overkill for [0,255] range |
-| v4b | Metal kernel, 8 iterations | **22** | No (21%) — 0 host round-trips, 1 GPU dispatch |
-
-### Optimization Progression on Huffman Stage (300s)
-
-| Version | Method | Time (ms) | Bottleneck? |
-|---------|--------|-----------|-------------|
-| v1 | CPU Python per-frame sequential | ~44,000 | Yes (shared w/ quant) |
-| v2 | CPU multiprocess (12 cores) | 1,100 | Yes (86%) |
-| v3 | Metal GPU (codeword + prefix sum + atomic scatter) | **30** | No (29%) |
-
-### Key Observations
-
-1. **5.2x faster than Apple AAC at 300s** — Python + MLX + Metal beats Apple's optimized C encoder
-2. **Pipeline is balanced** — no single stage exceeds 30% of total time
-3. **Total speedup from v1 to v5: 439x** (44.8s → 0.102s for 300s)
-4. **Metal eliminated two bottlenecks**: quantization (MLX eval overhead) and Huffman (Python bit-packing)
-5. **MLX matmul MDCT outperforms FFT MDCT** at this batch size — Apple's matmul kernel is highly optimized, and FFT path has more kernel launches
-6. **MLX framing (gather) 3x faster than numpy loop** — GPU-native indexing avoids CPU memory allocation
-
-### Per-Stage GPU Speedup (50 runs, mean ± std)
-
-| Duration | Frames | MDCT CPU (ms) | MDCT GPU (ms) | MDCT Speedup | Psycho CPU (ms) | Psycho GPU (ms) | Psycho Speedup |
-|----------|--------|---------------|---------------|--------------|-----------------|-----------------|----------------|
-| 10s | 431 | 1.24 ± 0.09 | 1.04 ± 0.52 | 1.19x | 3.42 ± 0.36 | 0.73 ± 0.28 | 4.71x |
-| 60s | 2,584 | 8.21 ± 0.21 | 2.57 ± 0.72 | 3.20x | 22.38 ± 1.22 | 1.92 ± 0.47 | 11.68x |
-| 300s | 12,920 | 38.52 ± 1.60 | 10.66 ± 0.20 | 3.61x | 121.09 ± 4.41 | 6.88 ± 0.53 | 17.60x |
-| 3600s | 155,040 | 491.16 ± 87.45 | 129.15 ± 22.04 | 3.80x | 1899.46 ± 444.97 | 82.49 ± 2.60 | 23.03x |
-
-### Cross-Encoder Comparison (encode-only, 128 kbps, 10 runs)
-
-All times are encode-only. MetalAAC encode-only times from standalone benchmark.
-
-| Encoder | 10s (ms) | 60s (ms) | 300s (ms) | 300s RTF | SNR (dB) | SC |
-|---------|----------|----------|-----------|----------|----------|-----|
-| **MetalAAC (ours)** | **22.5** | **32.7** | **102.0** | **0.000340** | 42.1 | 0.0034 |
-| Apple afconvert | 38.4 | 123.5 | 525.9 | 0.001753 | 30.0 | 0.0232 |
-| ffmpeg (native aac) | 143.6 | 438.4 | 1862.0 | 0.006207 | 49.0 | 0.0029 |
-| ffmpeg (aac_at) | 151.7 | 410.4 | 1642.2 | 0.005474 | 57.9 | 0.0008 |
-
-Notes:
-- **MetalAAC is 5.2x faster than Apple afconvert, 18x faster than ffmpeg** at 300s
-- ffmpeg aac_at uses Apple AudioToolbox under the hood (same engine as afconvert) but has more subprocess overhead
-- ffmpeg native aac has higher SNR than afconvert because it's a different encoder implementation
-- Quality comparison is approximate — different encoders use different psychoacoustic models
-- PyAV omitted from table: its AAC decode produced corrupted output (SNR=-0.0), likely a framing bug in the benchmark wrapper
-
-### Apple AAC (afconvert) Throughput (50 runs, mean ± std)
-
-| Duration | Apple Encode (ms) | Apple RTF |
-|----------|-------------------|-----------|
-| 10s | 38.6 ± 2.2 | 0.003865 |
-| 60s | 123.8 ± 2.9 | 0.002064 |
-| 300s | 527.7 ± 5.4 | 0.001759 |
-| 3600s | 6048.2 ± 61.3 | 0.001680 |
-
----
-
-## v0.7.0 ADTS Quality (ffmpeg decode, clipping-aware rate allocation)
-
-| Signal | SNR (dB) | Bitrate (kbps) | Avg nonzero q |
-|--------|----------|----------------|---------------|
-| sine_440 | 51.5 | 107.2 | 478 |
-| sine_1k | 50.6 | 105.9 | 463 |
-| sine_4k | 49.1 | 115.1 | 547 |
-| multitone | 50.2 | 111.9 | 419 |
-| chirp | 50.5 | 109.0 | 509 |
-| white_noise | 10.2 | 133.7 | 753 |
-| pink_noise | 16.2 | 135.4 | 726 |
-| music_1min | 46.1 | 111.6 | 514 |
-
-Notes:
-- Target bitrate: 128 kbps. Actual varies 105-136 kbps due to exp-Golomb bit estimation
-  vs actual Huffman coding in ADTS bitstream.
-- SNR improved from v0.6.x (46.6→51.5 dB for 440 Hz) because signal bands get stable
-  quality via clipping constraint while noise-floor bits are perceptually invisible.
-- Noise signals (white/pink) have inherently low SNR since reconstruction of wideband
-  noise requires extreme bit density.
-
-## v0.10.4 Speed Comparison (M3 Pro, 440 Hz sine, best of 5 runs)
-
-### Cross-Encoder Comparison (encode-only, 128 kbps mono)
-
-| Encoder | 10s | 60s | 300s |
-|---------|-----|-----|------|
-| Apple afconvert | 43 ms | 158 ms | 720 ms |
-| **MetalAAC** | **78 ms** | **354 ms** | **1574 ms** |
-| ffmpeg native aac | 137 ms | 400 ms | 1817 ms |
-
-MetalAAC is 2.2x slower than Apple afconvert but faster than ffmpeg.
-Bottleneck: 2-pass MLX quantization (53%) + transient detection (28%).
-
-### Cross-Decoder Comparison (60s mono ADTS)
-
-| Decoder | 60s | Notes |
-|---------|-----|-------|
-| **MetalAAC** | **67 ms** | Native C+GCD + MLX GPU |
-| ffmpeg | 118 ms | Includes process startup |
-
-MetalAAC decode is **1.8x faster than ffmpeg** (including ffmpeg subprocess overhead).
-
-### Decode Optimization History
-
-| Version | Method | 60s | Speedup |
-|---------|--------|-----|---------|
-| v0.10.1 | Python bit-by-bit tree | 2386 ms | baseline |
-| v0.10.2 | Python LUT + vectorized numpy | 1391 ms | 1.7x |
-| v0.10.3 | Native C + GCD | 102 ms | 23x |
-| **v0.10.4** | **+ MLX dequant/IMDCT** | **57 ms** | **42x** |
-
-### Encoder Stage Breakdown (60s mono ADTS)
-
-| Stage | Time (ms) | % | Accelerator |
-|-------|-----------|---|-------------|
-| Transient detect | 166 | 28% | MLX GPU |
-| Framing | 4 | 1% | MLX GPU |
-| MDCT | 41 | 7% | MLX GPU |
-| Psychoacoustic | 8 | 1% | MLX GPU |
-| Quantization (2-pass) | 309 | 53% | MLX GPU |
-| Huffman + ADTS | 55 | 9% | Metal GPU |
-| **Total** | **583** | |
-
-### Decoder Stage Breakdown (60s mono ADTS)
+## Encoder Stage Breakdown (60s mono ADTS)
 
 | Stage | Time (ms) | Accelerator |
 |-------|-----------|-------------|
-| Huffman parse | ~0 | Native C + GCD |
-| Dequantize | 7 | MLX GPU |
-| IMDCT | 21 | MLX GPU |
-| Overlap-add | 4 | NumPy |
-| **Total** | **57** (GPU) / **61** (CPU) |
+| Framing | 3 | MLX GPU |
+| Transient detect | 4 | MLX GPU |
+| MDCT | 27 | MLX GPU (matmul) |
+| Psychoacoustic | 3 | MLX GPU (FFT) |
+| Quantization | 9 | Metal GPU (binary search) |
+| Huffman + ADTS | 15 | Metal GPU |
+| **Total** | **61** | |
+
+## Decoder Stage Breakdown (60s mono ADTS)
+
+| Stage | Time (ms) | Accelerator |
+|-------|-----------|-------------|
+| Huffman parse + overhead | 24 | Native C + GCD |
+| Dequantize | 9 | MLX GPU |
+| IMDCT | 19 | MLX GPU (matmul) |
+| Overlap-add | 7 | NumPy |
+| **Total** | **56** (GPU) | |
+
+## Encode Optimization History
+
+| Version | 60s encode | vs Apple | Key change |
+|---------|-----------|----------|------------|
+| v0.1.0 | ~9000 ms | 57x slower | Python baseline |
+| v0.2.0 | 33 ms | 5x faster | Metal GPU pipeline (legacy format) |
+| v0.7.0 | 314 ms | 2x slower | ISO ADTS + clipping-aware rate allocation |
+| v0.11.0 | 320 ms | 2x slower | Single-pass quantization |
+| **v0.12.0** | **46 ms** | **3.4x faster** | Metal ISO quantizer |
+
+## Decode Optimization History
+
+| Version | 60s decode | Method |
+|---------|-----------|--------|
+| v0.10.1 | 2386 ms | Python bit-by-bit tree |
+| v0.10.2 | 1391 ms | Python LUT (1.7x) |
+| v0.10.3 | 102 ms | Native C + GCD (23x) |
+| **v0.10.4** | **56 ms** | + MLX dequant/IMDCT (42x) |
 
 ## Abandoned Directions
 
