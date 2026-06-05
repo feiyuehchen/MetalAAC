@@ -122,6 +122,154 @@ kernel void kernel_quantize(
 }
 
 // ============================================================
+// Kernel: ISO-native quantizer with clipping-aware per-band SF
+// One threadgroup per frame, 1024 threads per TG.
+// Computes safe_sf per band from max|x|, then binary-searches
+// sf_base [100,255] so per_band_sf = max(sf_base, safe_sf).
+// ============================================================
+kernel void kernel_quantize_iso(
+    device const float*   mdct_coeffs     [[buffer(0)]],   // (B*N)
+    device const int32_t* sfb_offsets_buf [[buffer(1)]],   // (num_sfb+1)
+    device const int32_t* sfb_map        [[buffer(2)]],   // (N,) coeff→sfb
+    device int32_t*       quantized_out  [[buffer(3)]],   // (B*N)
+    device int32_t*       sf_out         [[buffer(4)]],   // (B*num_sfb)
+    device int32_t*       gg_out         [[buffer(5)]],   // (B,)
+    device int32_t*       bits_out       [[buffer(6)]],   // (B,)
+    constant int32_t&     N              [[buffer(7)]],
+    constant int32_t&     num_sfb        [[buffer(8)]],
+    constant int32_t&     target_bits    [[buffer(9)]],
+    constant int32_t&     max_iterations [[buffer(10)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint gid [[threadgroup_position_in_grid]])
+{
+    threadgroup float abs_x_shared[1024];
+    threadgroup int   safe_sf[64];
+    threadgroup uint  bit_sums[1024];
+    threadgroup int   sf_base_lo, sf_base_hi, best_base, best_total;
+    threadgroup int   sf_base_cur;
+
+    uint b = gid;
+    uint idx = b * (uint)N + tid;
+
+    float coeff = (tid < (uint)N) ? mdct_coeffs[idx] : 0.0f;
+    float abs_x = fabs(coeff);
+    float sign_v = (coeff > 0.0f) ? 1.0f : ((coeff < 0.0f) ? -1.0f : 0.0f);
+    int my_sfb = (tid < (uint)N) ? sfb_map[tid] : 0;
+
+    abs_x_shared[tid] = abs_x;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread 0: compute per-band max|x| and safe_sf
+    if (tid == 0u) {
+        float q_limit = 1516.0f;  // 200^(4/3)
+        for (int sb = 0; sb < num_sfb; sb++) {
+            int lo = sfb_offsets_buf[sb];
+            int hi = sfb_offsets_buf[sb + 1];
+            float bmax = 0.0f;
+            for (int j = lo; j < hi && j < N; j++) {
+                if (abs_x_shared[j] > bmax) bmax = abs_x_shared[j];
+            }
+            float raw = 200.0f - 4.0f * log2(q_limit / (bmax + 1e-20f));
+            int sf = (int)ceil(raw);
+            if (sf < 100) sf = 100;
+            if (sf > 255) sf = 255;
+            safe_sf[sb] = sf;
+        }
+        sf_base_lo = 100;
+        sf_base_hi = 255;
+        best_base = 200;
+        best_total = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int my_safe = safe_sf[my_sfb];
+
+    // Binary search on sf_base
+    for (int iter = 0; iter < max_iterations; iter++) {
+        if (tid == 0u) {
+            sf_base_cur = (sf_base_lo + sf_base_hi) / 2;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        int sb = sf_base_cur;
+        int my_sf = (sb > my_safe) ? sb : my_safe;
+        if (my_sf < 100) my_sf = 100;
+        if (my_sf > 255) my_sf = 255;
+
+        float iqf = exp2((200.0f - (float)my_sf) / 4.0f);
+        float scaled = abs_x * iqf;
+        float q_raw = rint(pow(scaled + 1e-20f, 0.75f));
+        int q = (int)q_raw;
+        if (q > 255) q = 255;
+
+        // Exp-Golomb bit estimation
+        int aq = q;
+        uint cn = (aq > 0) ? (uint)(2 * aq - 1) : 0u;
+        uint v = cn + 1u;
+        uint m = (v > 0u) ? (31u - clz(v)) : 0u;
+        uint bits = 2u * m + 1u;
+
+        bit_sums[tid] = (tid < (uint)N) ? bits : 0u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint s = 512u; s > 0u; s >>= 1u) {
+            if (tid < s) bit_sums[tid] += bit_sums[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0u) {
+            int total = (int)bit_sums[0];
+            if (total <= target_bits) {
+                best_base = sf_base_cur;
+                best_total = total;
+                sf_base_hi = sf_base_cur - 1;
+            } else {
+                sf_base_lo = sf_base_cur + 1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Final quantization
+    int final_sf = (best_base > my_safe) ? best_base : my_safe;
+    if (final_sf < 100) final_sf = 100;
+    if (final_sf > 255) final_sf = 255;
+
+    if (tid < (uint)N) {
+        float iqf = exp2((200.0f - (float)final_sf) / 4.0f);
+        float scaled = abs_x * iqf;
+        int q = (int)rint(pow(scaled + 1e-20f, 0.75f));
+        if (q > 255) q = 255;
+        quantized_out[idx] = (int)(sign_v * (float)q);
+    }
+
+    // Write per-band SF
+    if (tid < (uint)num_sfb) {
+        int sf = (best_base > safe_sf[tid]) ? best_base : safe_sf[tid];
+        if (sf < 100) sf = 100;
+        if (sf > 255) sf = 255;
+        sf_out[b * (uint)num_sfb + tid] = sf;
+    }
+
+    if (tid == 0u) {
+        // Global gain = mean of non-zero-band SFs
+        int sum_sf = 0, cnt = 0;
+        for (int sb = 0; sb < num_sfb; sb++) {
+            int lo_s = sfb_offsets_buf[sb];
+            int hi_s = sfb_offsets_buf[sb + 1];
+            bool has_nz = false;
+            for (int j = lo_s; j < hi_s && j < N; j++) {
+                if (quantized_out[b * N + j] != 0) { has_nz = true; break; }
+            }
+            int sf = sf_out[b * (uint)num_sfb + sb];
+            if (has_nz) { sum_sf += sf; cnt++; }
+        }
+        gg_out[b] = (cnt > 0) ? (sum_sf / cnt) : best_base;
+        bits_out[b] = best_total;
+    }
+}
+
+// ============================================================
 // Kernel 6: Compute scalefactors from masking thresholds
 // One threadgroup per frame, num_sfb threads (49)
 // ============================================================

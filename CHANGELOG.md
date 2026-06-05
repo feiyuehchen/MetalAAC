@@ -5,6 +5,26 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-06-05
+
+### Added
+- **Metal ISO quantizer** (`kernel_quantize_iso`): clipping-aware per-band SF
+  allocation runs entirely on GPU — zero host round-trips. One threadgroup per
+  frame (1024 threads), 8-iteration binary search on sf_base [100,255] with
+  parallel bit-count reduction.
+
+### Performance
+- Quantization: **267 ms → 7.6 ms** (35x, MLX → Metal)
+- Encode 60s: **320 ms → 53 ms** (6x faster)
+- **3-4x faster than Apple afconvert** (53 ms vs 161 ms for 60s)
+- SNR: 52.9 dB (slightly improved from 51.6)
+
+| Duration | MetalAAC | Apple afconvert | Speedup |
+|----------|----------|-----------------|---------|
+| 10s | 24 ms | 44 ms | 1.8x |
+| 60s | 53 ms | 161 ms | 3.0x |
+| 300s | 176 ms | 709 ms | 4.0x |
+
 ## [0.11.0] - 2026-06-05
 
 ### Changed
