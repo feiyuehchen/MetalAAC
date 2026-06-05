@@ -5,6 +5,21 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-06-04
+
+### Changed
+- **LUT Huffman decoder**: replaced bit-by-bit tree traversal with flat lookup
+  tables (O(1) per codeword). Precomputed value tables for index→tuple mapping.
+- **Fast BitReader**: big-integer accumulator with O(1) peek/read/skip instead
+  of per-bit byte indexing.
+- **Vectorized dequantization**: `dequantize_iso_cpu` uses sfb_map broadcasting
+  instead of per-SFB Python loop.
+
+### Performance
+- Decode 60s: **2386 → 1391 ms** (1.7x speedup)
+- Dequantization: **269 → 46 ms** (5.8x)
+- Huffman parsing: **2132 → 1354 ms** (1.6x, still 95% — limited by Python loop)
+
 ## [0.10.1] - 2026-06-04
 
 ### Fixed

@@ -529,94 +529,115 @@ def encode_raw_data_block(
 
 
 class BitReader:
-    __slots__ = ('_data', '_pos', '_nbits')
+    """Fast bit reader using Python big-integer as accumulator."""
+    __slots__ = ('_acc', '_pos', '_nbits')
 
     def __init__(self, data: bytes):
-        self._data = data
-        self._pos = 0
         self._nbits = len(data) * 8
+        self._pos = 0
+        self._acc = int.from_bytes(data, 'big') if data else 0
 
     def read(self, n: int) -> int:
-        result = 0
-        for _ in range(n):
-            if self._pos >= self._nbits:
-                return result
-            byte_idx = self._pos >> 3
-            bit_idx = 7 - (self._pos & 7)
-            result = (result << 1) | ((self._data[byte_idx] >> bit_idx) & 1)
-            self._pos += 1
-        return result
+        shift = self._nbits - self._pos - n
+        self._pos += n
+        if shift < 0:
+            return (self._acc << (-shift)) & ((1 << n) - 1)
+        return (self._acc >> shift) & ((1 << n) - 1)
 
     def read1(self) -> int:
-        if self._pos >= self._nbits:
-            return 0
-        byte_idx = self._pos >> 3
-        bit_idx = 7 - (self._pos & 7)
+        shift = self._nbits - self._pos - 1
         self._pos += 1
-        return (self._data[byte_idx] >> bit_idx) & 1
+        if shift < 0:
+            return 0
+        return (self._acc >> shift) & 1
+
+    def peek(self, n: int) -> int:
+        shift = self._nbits - self._pos - n
+        if shift < 0:
+            return (self._acc << (-shift)) & ((1 << n) - 1)
+        return (self._acc >> shift) & ((1 << n) - 1)
+
+    def skip(self, n: int) -> None:
+        self._pos += n
 
     @property
     def remaining(self) -> int:
         return self._nbits - self._pos
 
 
-def _build_huff_tree(codes: list[int], lengths: list[int]) -> list:
-    """Build a binary tree for Huffman decoding. [left, right, value]."""
-    root = [None, None, None]
+def _build_huff_lut(codes: list[int], lengths: list[int]) -> tuple[list, int]:
+    """Build a flat lookup table for O(1) Huffman decoding.
+
+    Returns (lut, max_bits) where lut[prefix] = (value_index, code_length).
+    """
+    max_bits = max(lengths) if lengths else 0
+    if max_bits == 0:
+        return [], 0
+    lut_size = 1 << max_bits
+    lut = [(-1, 0)] * lut_size
     for i, (code, length) in enumerate(zip(codes, lengths)):
-        if length == 0:
+        if length == 0 or length > max_bits:
             continue
-        node = root
-        for bit in range(length - 1, -1, -1):
-            b = (code >> bit) & 1
-            if node[b] is None:
-                node[b] = [None, None, None]
-            node = node[b]
-        node[2] = i
-    return root
+        padding = max_bits - length
+        base = code << padding
+        for j in range(1 << padding):
+            lut[base + j] = (i, length)
+    return lut, max_bits
 
 
-def _huff_decode(br: BitReader, tree: list) -> int | None:
-    node = tree
-    while node[2] is None:
-        if br.remaining <= 0:
-            return None
-        b = br.read1()
-        node = node[b]
-        if node is None:
-            return None
-    return node[2]
+def _huff_decode_lut(br: BitReader, lut: list, max_bits: int) -> int | None:
+    if br.remaining < 1:
+        return None
+    bits = br.peek(min(max_bits, br.remaining))
+    if br.remaining < max_bits:
+        bits <<= (max_bits - br.remaining)
+    value, length = lut[bits]
+    if value < 0:
+        return None
+    br.skip(length)
+    return value
 
 
-_DECODE_TREES: dict[int, list] = {}
-_SF_DECODE_TREE: list | None = None
+_DECODE_LUTS: dict[int, tuple[list, int]] = {}
+_SF_DECODE_LUT: tuple[list, int] | None = None
 
 
-def _get_spectral_tree(cb_idx: int) -> list:
-    if cb_idx not in _DECODE_TREES:
+def _get_spectral_lut(cb_idx: int) -> tuple[list, int]:
+    if cb_idx not in _DECODE_LUTS:
         from metal_aac.tables import huffman_tables as ht
         codes = getattr(ht, f'CB{cb_idx}_CODES')
         lengths = getattr(ht, f'CB{cb_idx}_LENGTHS')
-        _DECODE_TREES[cb_idx] = _build_huff_tree(codes, lengths)
-    return _DECODE_TREES[cb_idx]
+        _DECODE_LUTS[cb_idx] = _build_huff_lut(codes, lengths)
+    return _DECODE_LUTS[cb_idx]
 
 
-def _get_sf_tree() -> list:
-    global _SF_DECODE_TREE
-    if _SF_DECODE_TREE is None:
-        _SF_DECODE_TREE = _build_huff_tree(SF_CODE_VALUES, SF_CODE_LENGTHS)
-    return _SF_DECODE_TREE
+def _get_sf_lut() -> tuple[list, int]:
+    global _SF_DECODE_LUT
+    if _SF_DECODE_LUT is None:
+        _SF_DECODE_LUT = _build_huff_lut(SF_CODE_VALUES, SF_CODE_LENGTHS)
+    return _SF_DECODE_LUT
 
 
-def _index_to_values(idx: int, dim: int, signed: bool, max_abs: int) -> tuple:
-    dim_size = (2 * max_abs + 1) if signed else (max_abs + 1)
-    offset = max_abs if signed else 0
-    vals = []
-    for _ in range(dim):
-        vals.append(idx % dim_size - offset)
-        idx //= dim_size
-    vals.reverse()
-    return tuple(vals)
+_VALUE_TABLES: dict[tuple, list] = {}
+
+
+def _get_value_table(dim: int, signed: bool, max_abs: int) -> list:
+    key = (dim, signed, max_abs)
+    if key not in _VALUE_TABLES:
+        dim_size = (2 * max_abs + 1) if signed else (max_abs + 1)
+        offset = max_abs if signed else 0
+        total = dim_size ** dim
+        table = [None] * total
+        for idx in range(total):
+            vals = []
+            rem = idx
+            for _ in range(dim):
+                vals.append(rem % dim_size - offset)
+                rem //= dim_size
+            vals.reverse()
+            table[idx] = tuple(vals)
+        _VALUE_TABLES[key] = table
+    return _VALUE_TABLES[key]
 
 
 def _read_escape(br: BitReader) -> int:
@@ -647,27 +668,25 @@ def _read_ics_body(
         sections.append((k, end, cb))
         k = end
 
+    sfb_cb = np.zeros(num_sfb_max, dtype=np.int32)
+    for s_start, s_end, s_cb in sections:
+        sfb_cb[s_start:s_end] = s_cb
+
     scalefactors = np.zeros(num_sfb_max, dtype=np.int32)
-    sf_tree = _get_sf_tree()
+    sf_lut, sf_max_bits = _get_sf_lut()
     prev_sf = global_gain
     for sb in range(num_sfb):
-        cb = ZERO_HCB
-        for s_start, s_end, s_cb in sections:
-            if s_start <= sb < s_end:
-                cb = s_cb
-                break
-        if cb == ZERO_HCB:
+        if sfb_cb[sb] == ZERO_HCB:
             scalefactors[sb] = prev_sf
             continue
-        idx = _huff_decode(br, sf_tree)
+        idx = _huff_decode_lut(br, sf_lut, sf_max_bits)
         if idx is None:
             scalefactors[sb] = prev_sf
             continue
-        diff = idx - 60
-        prev_sf += diff
+        prev_sf += idx - 60
         scalefactors[sb] = prev_sf
 
-    br.read(1); br.read(1); br.read(1)
+    br.skip(3)
 
     n_coeffs = sfb_offsets[-1] if sfb_offsets else 1024
     quantized = np.zeros(n_coeffs, dtype=np.int32)
@@ -676,29 +695,28 @@ def _read_ics_body(
         if cb == ZERO_HCB or cb not in CODEBOOKS:
             continue
         codebook = CODEBOOKS[cb]
-        tree = _get_spectral_tree(cb)
+        lut, max_bits = _get_spectral_lut(cb)
+        vtable = _get_value_table(codebook.dimension, codebook.signed, codebook.max_abs)
         lo = sfb_offsets[start_sfb]
         hi = min(sfb_offsets[end_sfb], n_coeffs)
 
         if codebook.dimension == 4:
             for i in range(lo, hi, 4):
-                idx = _huff_decode(br, tree)
+                idx = _huff_decode_lut(br, lut, max_bits)
                 if idx is None:
                     break
-                vals = list(_index_to_values(idx, 4, codebook.signed, codebook.max_abs))
+                vals = list(vtable[idx])
                 if not codebook.signed:
                     for k in range(4):
                         if vals[k] > 0 and br.read1():
                             vals[k] = -vals[k]
-                for k in range(4):
-                    if i + k < n_coeffs:
-                        quantized[i + k] = vals[k]
+                quantized[i:min(i+4, n_coeffs)] = vals[:min(4, n_coeffs-i)]
         else:
             for i in range(lo, hi, 2):
-                idx = _huff_decode(br, tree)
+                idx = _huff_decode_lut(br, lut, max_bits)
                 if idx is None:
                     break
-                vals = list(_index_to_values(idx, 2, codebook.signed, codebook.max_abs))
+                vals = list(vtable[idx])
                 if not codebook.signed:
                     for k in range(2):
                         if vals[k] > 0 and br.read1():
@@ -708,9 +726,7 @@ def _read_ics_body(
                             if abs(vals[k]) >= 16:
                                 sign = -1 if vals[k] < 0 else 1
                                 vals[k] = sign * _read_escape(br)
-                for k in range(2):
-                    if i + k < n_coeffs:
-                        quantized[i + k] = vals[k]
+                quantized[i:min(i+2, n_coeffs)] = vals[:min(2, n_coeffs-i)]
 
     return quantized, scalefactors
 
