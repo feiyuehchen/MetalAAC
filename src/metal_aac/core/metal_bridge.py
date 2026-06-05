@@ -248,13 +248,14 @@ class MetalHuffman:
         target_bits: int,
         sample_rate: int = 44100,
         max_iterations: int = 8,
+        custom_sfb_offsets: list[int] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """ISO quantization on Metal GPU with clipping-aware per-band SF."""
         from metal_aac.tables.scalefactor_bands import get_sfb_offsets
         from metal_aac.core.quantization import _build_sfb_map
 
         B, N = mdct_coeffs.shape
-        sfb_offsets = get_sfb_offsets(sample_rate)
+        sfb_offsets = custom_sfb_offsets if custom_sfb_offsets is not None else get_sfb_offsets(sample_rate)
         num_sfb = len(sfb_offsets) - 1
         sfb_map = _build_sfb_map(sfb_offsets, N)
 

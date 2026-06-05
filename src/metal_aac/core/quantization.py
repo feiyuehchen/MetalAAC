@@ -261,6 +261,43 @@ def dequantize_gpu(
     return reconstructed
 
 
+def reorder_short_to_iso(coeffs_flat: np.ndarray, short_sfb: list[int], num_win: int = 8) -> tuple[np.ndarray, list[int]]:
+    """Reorder (B, 1024) from linear 8×128 flatten to ISO SFB-interleaved order.
+
+    Returns (reordered, iso_sfb_offsets) where iso_sfb_offsets maps the 14 short
+    bands across num_win windows into a flat 1024-coefficient layout.
+    """
+    B = coeffs_flat.shape[0]
+    grouped = coeffs_flat.reshape(B, num_win, 128)
+    num_sfb = len(short_sfb) - 1
+    result = np.zeros_like(coeffs_flat)
+    iso_offsets = [0]
+    pos = 0
+    for sb in range(num_sfb):
+        lo, hi = short_sfb[sb], short_sfb[sb + 1]
+        w = hi - lo
+        for win in range(num_win):
+            result[:, pos:pos + w] = grouped[:, win, lo:hi]
+            pos += w
+        iso_offsets.append(pos)
+    return result, iso_offsets
+
+
+def reorder_iso_to_short(coeffs_iso: np.ndarray, short_sfb: list[int], num_win: int = 8) -> np.ndarray:
+    """Inverse of reorder_short_to_iso: ISO interleaved → linear 8×128."""
+    B = coeffs_iso.shape[0]
+    num_sfb = len(short_sfb) - 1
+    grouped = np.zeros((B, num_win, 128), dtype=coeffs_iso.dtype)
+    pos = 0
+    for sb in range(num_sfb):
+        lo, hi = short_sfb[sb], short_sfb[sb + 1]
+        w = hi - lo
+        for win in range(num_win):
+            grouped[:, win, lo:hi] = coeffs_iso[:, pos:pos + w]
+            pos += w
+    return grouped.reshape(B, -1)
+
+
 def precompute_sf_gains(
     global_gain: int,
     scalefactors: np.ndarray,
