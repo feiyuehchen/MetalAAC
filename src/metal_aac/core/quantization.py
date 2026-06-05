@@ -329,6 +329,8 @@ def quantize_batch_gpu(
 ) -> QuantizationResult:
     """ISO-native quantizer with clipping-aware per-band SF allocation.
 
+    masking_thresholds: currently unused (reserved for future perceptual shaping).
+
     Each band's SF is set to max(sf_base, safe_sf[band]):
     - safe_sf[band]: minimum SF to avoid q > 255 (from band's peak amplitude)
     - sf_base: uniform floor controlled by binary search to meet bit budget
@@ -402,7 +404,18 @@ def quantize_batch_gpu(
     mx.eval(final_q, final_sf)
 
     iso_sf_np = np.array(final_sf)
-    iso_gg = np.mean(iso_sf_np, axis=-1).astype(np.int32)
+    q_np = np.array(final_q)
+    iso_gg = np.zeros(batch, dtype=np.int32)
+    for b in range(batch):
+        nz_mask = np.zeros(num_sfb, dtype=bool)
+        for sb in range(num_sfb):
+            lo, hi = sfb_offsets[sb], sfb_offsets[sb + 1]
+            if np.any(q_np[b, lo:hi] != 0):
+                nz_mask[sb] = True
+        if np.any(nz_mask):
+            iso_gg[b] = int(np.mean(iso_sf_np[b, nz_mask]))
+        else:
+            iso_gg[b] = int(np.mean(iso_sf_np[b]))
 
     return QuantizationResult(
         quantized=np.array(final_q),
