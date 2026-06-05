@@ -1,49 +1,33 @@
 # MetalAAC
 
-GPU-accelerated AAC encoder/decoder for Apple Silicon, using MLX and Metal compute shaders.
+GPU-accelerated AAC-LC encoder/decoder for Apple Silicon, using MLX + Metal compute shaders + native C.
 
-**5.2x faster than Apple's `afconvert`** and **18x faster than ffmpeg** at encoding 5 minutes of audio on M3 Pro.
+Produces ISO/IEC 14496-3 compliant ADTS output decodable by ffmpeg/VLC. Supports mono and stereo with M/S coding.
 
-## Benchmark (300s audio, 128 kbps, encode-only)
+## Current State (v0.10.3)
 
-| Encoder | Time | vs MetalAAC |
-|---------|------|-------------|
-| **MetalAAC** | **102 ms** | — |
-| Apple afconvert | 526 ms | 5.2x slower |
-| ffmpeg (aac_at) | 1,642 ms | 16x slower |
-| ffmpeg (native aac) | 1,862 ms | 18x slower |
-
-All numbers on Apple M3 Pro, best of 5 runs. Full results with 50-run std in [BENCHMARK.md](BENCHMARK.md).
-
-## How it works
-
-Each AAC pipeline stage runs on the accelerator best suited for it:
-
-```
-PCM ─→ Framing ─→ MDCT ─→ Psychoacoustic ─→ Quantization ─→ Huffman ─→ Bitstream
-       MLX GPU    MLX GPU   MLX GPU           Metal GPU       Metal GPU
-       (gather)   (matmul)  (FFT+matmul)      (binary search  (prefix sum +
-                                               + parallel      atomic scatter
-                                               reduction)      write)
-```
-
-The key insight: MLX is ideal for array-level operations (MDCT, psychoacoustic model), but stages requiring per-thread control flow (Huffman bit packing, quantization binary search) need Metal compute shaders. Moving both to Metal eliminated the Python-to-GPU round-trip overhead that dominated the pipeline.
+| Metric | Value |
+|--------|-------|
+| Encode 60s mono | 505 ms (RTF 0.008) |
+| Decode 60s mono (GPU) | 74 ms (RTF 0.001) |
+| SNR (440 Hz sine, ffmpeg roundtrip) | 51.6 dB |
+| Bitrate accuracy | 125-136 kbps at 128 target |
+| Stereo | M/S coding, 51.7 dB per channel |
+| Tests | 82 passing |
 
 ## Setup
 
 Requires macOS with Apple Silicon (M1/M2/M3/M4) and Python 3.11+.
 
 ```bash
-# Clone
 git clone git@github.com:feiyuehchen/MetalAAC.git
 cd MetalAAC
 
-# Build Metal shaders
+# Build native library (Metal shaders + C Huffman decoder)
 cd metal && make && cd ..
 
 # Install Python package
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install mlx numpy pyyaml pytest
 pip install -e ".[dev]"
 
@@ -53,123 +37,131 @@ python -m pytest tests/
 
 ## Usage
 
-### Encode / Decode
+### Encode
 
 ```python
-from metal_aac.encoder import EncoderConfig, encode
-from metal_aac.decoder import DecoderConfig, decode
+import numpy as np
+from metal_aac.encoder import encode, EncoderConfig
 
-# Encode
-result = encode(pcm_float32, EncoderConfig(
+# Mono
+pcm = np.random.randn(44100 * 5).astype(np.float32) * 0.5
+result = encode(pcm, EncoderConfig(
     sample_rate=44100,
     target_bitrate_kbps=128.0,
-    use_gpu=True,  # MLX + Metal path
+    output_format="adts",
 ))
-bitstream = result.bitstream
-print(f"{result.num_frames} frames, {result.actual_bitrate_kbps:.1f} kbps")
-print(f"Timings: {result.timings}")
+with open("output.aac", "wb") as f:
+    f.write(result.bitstream)
 
-# Decode
-decoded = decode(bitstream, DecoderConfig(
-    use_gpu=True,
-    output_length=len(pcm_float32),
-))
-reconstructed = decoded.pcm
+# Stereo (M/S coding automatic)
+stereo = np.column_stack([left_channel, right_channel])
+result = encode(stereo, EncoderConfig(output_format="adts"))
+```
+
+### Decode
+
+```python
+from metal_aac.decoder import decode, DecoderConfig
+
+result = decode(bitstream, DecoderConfig(use_gpu=True))
+pcm = result.pcm          # (N,) mono or (N, 2) stereo
+sr = result.sample_rate    # 44100
 ```
 
 ### Benchmark
 
 ```bash
-# Per-stage CPU vs GPU comparison
-python scripts/benchmark.py --signals sine_440 chirp long_music
-
-# Full 50-run benchmark across durations
-python scripts/benchmark_full.py --n-runs 50
-
-# Compare against Apple AAC and ffmpeg
+python scripts/benchmark.py
 python scripts/compare_all_encoders.py --durations 10 60 300
 ```
 
-### Metal Huffman (direct API)
+## Architecture
 
-```python
-from metal_aac.core.metal_bridge import MetalHuffman
-
-metal = MetalHuffman.shared()
-
-# Encode: quantized (B, 1024) int32 → list of packed byte arrays
-frames = metal.encode_frames(quantized, scalefactors, global_gains)
-
-# Decode: list of byte arrays → quantized (B, 1024) int32
-quantized, scalefactors, gains = metal.decode_frames(frame_payloads)
-
-# Full quantization on GPU (binary search + bit estimation)
-q, sf, gg, bits = metal.quantize(
-    mdct_coeffs, masking_thresholds,
-    target_bits_per_frame=2972,
-)
 ```
+Encoder:
+  PCM -> Framing -> MDCT -> Psychoacoustic -> M/S Stereo -> Quantization -> Huffman -> ADTS
+         MLX GPU   MLX GPU  MLX GPU          MLX GPU       MLX GPU         Metal GPU
+
+Decoder:
+  ADTS -> Huffman parse -> Dequantize -> Inverse M/S -> IMDCT -> Overlap-Add -> PCM
+          Native C+GCD    NumPy/MLX    NumPy          MLX GPU   NumPy
+```
+
+### Encoder stages (60s mono)
+
+| Stage | Time | Accelerator |
+|-------|------|-------------|
+| Transient detect | 166 ms | MLX GPU |
+| MDCT | 41 ms | MLX GPU (batch matmul) |
+| Psychoacoustic | 8 ms | MLX GPU (FFT + matmul) |
+| Quantization | 309 ms | MLX GPU (binary search, 2-pass) |
+| Huffman + ADTS | 55 ms | Metal GPU |
+| **Total** | **583 ms** | |
+
+### Decoder stages (60s mono)
+
+| Stage | Time | Accelerator |
+|-------|------|-------------|
+| Huffman parse | ~0 ms | Native C + GCD (LUT decode) |
+| Dequantize | 45 ms | NumPy vectorized |
+| IMDCT | 22 ms | MLX GPU |
+| Overlap-add | 4 ms | NumPy |
+| **Total** | **74 ms** (GPU) | |
 
 ## Project structure
 
 ```
 MetalAAC/
-├── DATASET.md              # Test signal specification (research contract)
-├── BENCHMARK.md            # Metric definitions + all results (research contract)
-├── CHANGELOG.md            # Version history
-│
-├── metal/                  # GPU compute shaders (Objective-C + MSL)
-│   ├── huffman_kernels.metal   # 7 Metal compute kernels
-│   ├── metal_huffman.h         # C API
-│   ├── metal_huffman.m         # ObjC host code
+├── metal/                          # Native code (ObjC + Metal shaders)
+│   ├── huffman_kernels.metal       # 8 Metal compute kernels
+│   ├── metal_huffman.h/.m          # ObjC host + C ISO decoder (GCD parallel)
 │   └── Makefile
 │
-├── src/metal_aac/          # Python package
+├── src/metal_aac/
 │   ├── core/
-│   │   ├── mdct.py             # MDCT/IMDCT (CPU NumPy + GPU MLX)
-│   │   ├── psychoacoustic.py   # Psychoacoustic model (CPU + GPU)
-│   │   ├── quantization.py     # Quantization (CPU + MLX + Metal)
-│   │   ├── huffman.py          # Entropy coding (CPU + Metal)
-│   │   ├── bitstream.py        # Frame format reader/writer
-│   │   └── metal_bridge.py     # ctypes wrapper for Metal dylib
-│   ├── encoder.py              # Encoder pipeline
-│   ├── decoder.py              # Decoder pipeline
-│   ├── data/synthetic.py       # Deterministic test signal generation
-│   ├── metrics/                # SNR, spectral convergence, RTF
-│   └── tables/                 # SFB tables, window functions
+│   │   ├── mdct.py                 # MDCT/IMDCT (CPU + MLX GPU)
+│   │   ├── psychoacoustic.py       # Bark-scale masking (CPU + GPU)
+│   │   ├── quantization.py         # ISO quantizer (clipping-aware per-band SF)
+│   │   ├── raw_data_block.py       # ISO bitstream encoder/decoder (SCE + CPE)
+│   │   ├── adts.py                 # ADTS header writer/reader
+│   │   ├── metal_bridge.py         # ctypes wrapper for native library
+│   │   └── window_switching.py     # Transient detection + state machine
+│   ├── encoder.py                  # Encode pipeline (mono + stereo)
+│   ├── decoder.py                  # Decode pipeline (mono + stereo)
+│   └── tables/                     # Huffman codebooks, SFB tables, windows
 │
-├── scripts/                # Benchmarking and comparison tools
-└── tests/                  # 44 tests (contract + correctness + round-trip)
+├── DATASET.md                      # Test signal specification
+├── BENCHMARK.md                    # Metric definitions + results
+├── CHANGELOG.md                    # v0.1.0 -- v0.10.3
+└── tests/                          # 82 tests
 ```
 
-## Metal kernels
+## Version history
 
-| Kernel | Grid | Purpose |
-|--------|------|---------|
-| `kernel_compute_codewords` | (N, B) | Exp-Golomb codeword + length via `clz()` |
-| `kernel_prefix_sum` | B groups × 1024 threads | Blelloch exclusive scan in shared memory |
-| `kernel_scatter_write` | B groups × 1024 threads | Atomic OR on uint32 words for bit packing |
-| `kernel_decode_frames` | B threads | Sequential exp-Golomb decode per frame |
-| `kernel_quantize` | B groups × 1024 threads | Binary search with parallel reduction |
-| `kernel_compute_scalefactors` | B groups × 49 threads | SMR → scalefactor mapping |
-| `kernel_zero_output` | total bytes | Buffer initialization |
-
-## Optimization history
-
-| Version | 300s encode | vs Apple | Key change |
-|---------|-------------|----------|------------|
-| v0.1.0 CPU | 44,789 ms | 85x slower | Pure Python baseline |
-| + MLX GPU | 1,754 ms | 3.3x slower | Batch MDCT + psychoacoustic on GPU |
-| + Metal Huffman | 699 ms | 1.3x slower | 4-kernel Huffman pipeline |
-| + Metal quantize | 121 ms | 4.4x faster | Binary search in single dispatch |
-| **+ MLX framing** | **102 ms** | **5.2x faster** | GPU gather indexing |
+| Version | Key change |
+|---------|-----------|
+| v0.1.0 | Python baseline |
+| v0.2.0 | Metal GPU pipeline (5.2x faster than Apple, legacy format) |
+| v0.3.0 | ISO Huffman + ADTS, ffmpeg decodable |
+| v0.4.0 | ISO SF calibration (SNR 13 dB) |
+| v0.5.0 | MDCT 2/N normalization (SNR 25 dB) |
+| v0.6.0 | ISO-native quantizer (SNR 47 dB) |
+| v0.6.1 | Metal ADTS kernel uses ISO SFs directly |
+| v0.7.0 | Clipping-aware rate allocation (10 -> 107 kbps) |
+| v0.8.0 | ADTS decoder (no ffmpeg dependency) |
+| v0.8.1 | Adaptive bitrate calibration |
+| v0.9.0 | Stereo CPE encoding/decoding |
+| v0.10.0 | M/S stereo + bit reservoir |
+| v0.10.1 | Code review: 9 bug fixes |
+| v0.10.2 | LUT Huffman + vectorized dequant |
+| v0.10.3 | Native C+GCD decoder (23x faster) |
 
 ## Research workflow
 
-This project follows the [AI Research Code Workflow](https://github.com/feiyuehchen/MetalAAC/blob/main/CHANGELOG.md):
+This project follows the [AI Research Code Workflow](../ai-research-code-workflow.md):
 - **DATASET.md** and **BENCHMARK.md** are the research contracts
 - Version bumps follow research-adapted SemVer
-- Changes to metric definitions or dataset spec trigger MAJOR bumps
+- Changes to metric definitions trigger MAJOR bumps
 - All benchmark results accumulate in BENCHMARK.md Part B
 
 ## License
