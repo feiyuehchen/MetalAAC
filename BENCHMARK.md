@@ -234,6 +234,48 @@ Notes:
 - Noise signals (white/pink) have inherently low SNR since reconstruction of wideband
   noise requires extreme bit density.
 
+## v0.10.x Speed Comparison (M3 Pro, best of 3-5 runs)
+
+### Encoder Speed
+
+| Mode | 10s | 60s | 300s | RTF |
+|------|-----|-----|------|-----|
+| **Mono ADTS** | 86 ms | 346 ms | 1634 ms | 0.0054 |
+| **Stereo ADTS** | 482 ms | 2659 ms | — | 0.044 |
+| Apple afconvert (mono) | — | 29 ms | — | 0.0005 |
+| ffmpeg native aac (mono) | — | 407 ms | — | 0.0068 |
+
+Notes:
+- Mono ADTS is ~12x slower than Apple afconvert. Bottleneck: 2-pass MLX quantization
+  (60%) + transient detection (24%). Legacy Metal path (v0.2.0) was 33ms/60s.
+- Stereo adds M/S transform + 2× quantization + Python CPE encoding loop.
+- ffmpeg native aac is comparable speed to MetalAAC mono.
+
+### Decoder Speed
+
+| Mode | 10s | 60s | 300s | Bottleneck |
+|------|-----|-----|------|-----------|
+| **CPU decode** | 401 ms | 2386 ms | 12894 ms | Huffman parsing 88% |
+| **GPU decode** | 358 ms | 2155 ms | 11584 ms | Huffman parsing 88% |
+
+Notes:
+- Decoder is ~40x slower than real-time. Bottleneck is Python bit-by-bit
+  Huffman tree traversal (88% of time). Dequantization is 11%.
+- GPU decode only accelerates IMDCT/dequant, not Huffman parsing.
+- For playback use cases, ffmpeg decode is recommended.
+
+### Encoder Stage Breakdown (60s mono ADTS)
+
+| Stage | Time (ms) | % |
+|-------|-----------|---|
+| Transient detect | 119 | 24% |
+| Framing | 3 | 1% |
+| MDCT | 26 | 5% |
+| Psychoacoustic | 6 | 1% |
+| Quantization (2-pass) | 302 | 60% |
+| Huffman + bitstream | 50 | 10% |
+| **Total** | **505** | |
+
 ## Abandoned Directions
 
 ### GPU precomputed codewords + multiprocess packing
