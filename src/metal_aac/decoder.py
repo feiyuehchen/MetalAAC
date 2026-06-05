@@ -223,18 +223,35 @@ def _decode_cpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
                 num_frames=len(parsed_frames), timings=timings,
             )
 
-        decoded_frames = []
-        for (payload,) in parsed_frames:
-            if is_adts:
-                quantized, scalefactors, global_gain = decode_raw_data_block_iso(
-                    payload, sample_rate
+        if is_adts:
+            try:
+                from metal_aac.core.metal_bridge import MetalHuffman
+                metal = MetalHuffman.shared()
+                payloads = [p for (p,) in parsed_frames]
+                all_q, all_sf, all_gg = metal.decode_iso_frames(
+                    payloads, sample_rate, config.frame_size // 2
                 )
-            else:
+                timings["huffman_bitstream"] = t.elapsed
+                decoded_frames = [
+                    (all_q[i], all_sf[i], int(all_gg[i]))
+                    for i in range(len(payloads))
+                ]
+            except (OSError, RuntimeError, FileNotFoundError):
+                decoded_frames = []
+                for (payload,) in parsed_frames:
+                    quantized, scalefactors, global_gain = decode_raw_data_block_iso(
+                        payload, sample_rate
+                    )
+                    decoded_frames.append((quantized, scalefactors, global_gain))
+                timings["huffman_bitstream"] = t.elapsed
+        else:
+            decoded_frames = []
+            for (payload,) in parsed_frames:
                 quantized, scalefactors, global_gain = decode_spectral_data(
                     payload, sample_rate
                 )
-            decoded_frames.append((quantized, scalefactors, global_gain))
-    timings["huffman_bitstream"] = t.elapsed
+                decoded_frames.append((quantized, scalefactors, global_gain))
+            timings["huffman_bitstream"] = t.elapsed
 
     pcm = _decode_channel(decoded_frames, num_sfb, config, sample_rate, is_adts, timings)
 

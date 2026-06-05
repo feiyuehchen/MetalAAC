@@ -5,6 +5,18 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-06-04
+
+### Added
+- **Native C ISO Huffman decoder**: `metal_decode_iso_frames()` in ObjC with
+  GCD `dispatch_apply` for multi-frame parallelism. LUT-based O(1) decode
+  per codeword. Cached decode LUTs (built once, reused across calls).
+
+### Performance
+- Decode 60s: **2386 → 102 ms** (23x speedup from original Python)
+- Huffman parsing: **2132 → ~0 ms** (native C eliminates Python loop)
+- Remaining bottleneck: dequantization 46ms + IMDCT 22ms (numpy/MLX)
+
 ## [0.10.2] - 2026-06-04
 
 ### Changed

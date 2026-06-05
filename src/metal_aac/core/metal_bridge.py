@@ -306,6 +306,128 @@ class MetalHuffman:
 
         return q_out, sf_out, gg_out, tb_out
 
+    _iso_decode_cache: dict | None = None
+
+    @classmethod
+    def _get_decode_luts(cls):
+        if cls._iso_decode_cache is not None:
+            return cls._iso_decode_cache
+        from metal_aac.tables import huffman_tables as ht
+        import struct as st
+
+        cb_dims_arr = [0, 4, 4, 4, 4, 2, 2, 2, 2, 2, 2, 2]
+        cb_signed_arr = [0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0]
+        cb_max_abs_arr = [0, 1, 1, 2, 2, 4, 4, 7, 7, 12, 12, 16]
+        lut_offsets_arr = [0] * 12
+        lut_max_bits_arr = [0] * 12
+        spec_lut_data = bytearray()
+
+        for cb_idx in range(1, 12):
+            codes = getattr(ht, f'CB{cb_idx}_CODES')
+            lengths = getattr(ht, f'CB{cb_idx}_LENGTHS')
+            max_bits = max(lengths)
+            lut_max_bits_arr[cb_idx] = max_bits
+            lut_offsets_arr[cb_idx] = len(spec_lut_data) // 4
+            lut_size = 1 << max_bits
+            for prefix in range(lut_size):
+                best_val, best_len = -1, 0
+                for i, (code, length) in enumerate(zip(codes, lengths)):
+                    if length == 0 or length > max_bits:
+                        continue
+                    if (prefix >> (max_bits - length)) == code:
+                        best_val, best_len = i, length
+                        break
+                spec_lut_data += st.pack('<hh', best_val, best_len)
+
+        sf_codes = ht.SF_CODE_VALUES
+        sf_lengths = ht.SF_CODE_LENGTHS
+        sf_max_bits = max(sf_lengths)
+        sf_lut_data = bytearray()
+        for prefix in range(1 << sf_max_bits):
+            best_val, best_len = -1, 0
+            for i, (code, length) in enumerate(zip(sf_codes, sf_lengths)):
+                if length == 0 or length > sf_max_bits:
+                    continue
+                if (prefix >> (sf_max_bits - length)) == code:
+                    best_val, best_len = i, length
+                    break
+            sf_lut_data += st.pack('<hh', best_val, best_len)
+
+        cls._iso_decode_cache = {
+            'spec_bytes': bytes(spec_lut_data),
+            'sf_bytes': bytes(sf_lut_data),
+            'lut_offsets': np.array(lut_offsets_arr, dtype=np.int32),
+            'lut_max_bits': np.array(lut_max_bits_arr, dtype=np.int32),
+            'cb_dims': np.array(cb_dims_arr, dtype=np.int32),
+            'cb_signed': np.array(cb_signed_arr, dtype=np.int32),
+            'cb_max_abs': np.array(cb_max_abs_arr, dtype=np.int32),
+            'sf_max_bits': sf_max_bits,
+        }
+        return cls._iso_decode_cache
+
+    def decode_iso_frames(
+        self,
+        payloads: list[bytes],
+        sample_rate: int = 44100,
+        N: int = 1024,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Decode ISO Huffman frames using native C with GCD parallelism."""
+        from metal_aac.tables.scalefactor_bands import get_sfb_offsets
+
+        sfb_offsets = get_sfb_offsets(sample_rate)
+        num_sfb = len(sfb_offsets) - 1
+        B = len(payloads)
+
+        concat = b''.join(payloads)
+        offsets = np.zeros(B + 1, dtype=np.int32)
+        pos = 0
+        for i, p in enumerate(payloads):
+            offsets[i] = pos
+            pos += len(p)
+        offsets[B] = pos
+
+        cache = self._get_decode_luts()
+
+        if not hasattr(self._lib, '_iso_decode_setup'):
+            self._lib.metal_decode_iso_frames.restype = ctypes.c_int
+            self._lib.metal_decode_iso_frames.argtypes = [
+                ctypes.POINTER(ctypes.c_uint8), _c_int32_p,
+                ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+                _c_int32_p,
+                ctypes.c_void_p, _c_int32_p, _c_int32_p,
+                _c_int32_p, _c_int32_p, _c_int32_p,
+                ctypes.c_void_p, ctypes.c_int32,
+                _c_int32_p, _c_int32_p, _c_int32_p,
+            ]
+            self._lib._iso_decode_setup = True
+
+        concat_arr = np.frombuffer(concat, dtype=np.uint8).copy()
+        sfb_arr = np.array(sfb_offsets, dtype=np.int32)
+        q_out = np.zeros(B * N, dtype=np.int32)
+        sf_out = np.zeros(B * num_sfb, dtype=np.int32)
+        gg_out = np.zeros(B, dtype=np.int32)
+
+        rc = self._lib.metal_decode_iso_frames(
+            concat_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            offsets.ctypes.data_as(_c_int32_p),
+            B, N, num_sfb,
+            sfb_arr.ctypes.data_as(_c_int32_p),
+            cache['spec_bytes'],
+            cache['lut_offsets'].ctypes.data_as(_c_int32_p),
+            cache['lut_max_bits'].ctypes.data_as(_c_int32_p),
+            cache['cb_dims'].ctypes.data_as(_c_int32_p),
+            cache['cb_signed'].ctypes.data_as(_c_int32_p),
+            cache['cb_max_abs'].ctypes.data_as(_c_int32_p),
+            cache['sf_bytes'], cache['sf_max_bits'],
+            q_out.ctypes.data_as(_c_int32_p),
+            sf_out.ctypes.data_as(_c_int32_p),
+            gg_out.ctypes.data_as(_c_int32_p),
+        )
+        if rc != 0:
+            raise RuntimeError(f"Native ISO decode failed (rc={rc})")
+
+        return q_out.reshape(B, N), sf_out.reshape(B, num_sfb), gg_out
+
     def __del__(self):
         if hasattr(self, "_ctx") and self._ctx:
             self._lib.metal_huffman_destroy(self._ctx)
