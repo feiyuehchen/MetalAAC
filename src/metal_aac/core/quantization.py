@@ -207,21 +207,15 @@ def dequantize_iso_cpu(
     """
     batch, n_coeffs = quantized.shape
     sfb_offsets = get_sfb_offsets(sample_rate)
-    num_sfb = len(sfb_offsets) - 1
-    output = np.zeros((batch, n_coeffs), dtype=np.float32)
+    sfb_map = _build_sfb_map(sfb_offsets, n_coeffs)
 
-    for b in range(batch):
-        for sb in range(num_sfb):
-            lo, hi = sfb_offsets[sb], sfb_offsets[sb + 1]
-            sf = int(iso_scalefactors[b, sb])
-            scale = 2.0 ** ((sf - 200) / 4.0)
+    per_coeff_sf = iso_scalefactors[:, sfb_map].astype(np.float32)
+    scale = np.power(2.0, (per_coeff_sf - 200.0) / 4.0)
 
-            q = quantized[b, lo:hi].astype(np.float32)
-            signs = np.sign(q)
-            abs_q = np.abs(q)
-            output[b, lo:hi] = signs * np.power(abs_q, 4.0 / 3.0) * scale
-
-    return output
+    q = quantized.astype(np.float32)
+    signs = np.sign(q)
+    abs_q = np.abs(q)
+    return signs * np.power(abs_q, 4.0 / 3.0) * scale
 
 
 # ---- GPU implementation ----
