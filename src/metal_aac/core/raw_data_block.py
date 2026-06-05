@@ -345,8 +345,12 @@ def encode_cpe_iso(
     q_r: np.ndarray, sf_r: np.ndarray, gg_r: int,
     window_sequence: int = 0,
     sample_rate: int = 44100,
+    ms_used: np.ndarray | None = None,
 ) -> bytes:
-    """Encode a stereo frame as a Channel Pair Element (CPE)."""
+    """Encode a stereo frame as a Channel Pair Element (CPE).
+
+    ms_used: (num_sfb,) bool — which SFBs use M/S coding. None = no M/S.
+    """
     sfb_offsets = get_sfb_offsets(sample_rate)
     num_sfb = len(sfb_offsets) - 1
 
@@ -358,25 +362,29 @@ def encode_cpe_iso(
     bw.write(0, 4)   # element_instance_tag
     bw.write(1, 1)   # common_window
 
-    # shared ics_info
     bw.write(0, 1)   # reserved
     bw.write(window_sequence & 0x3, 2)
     bw.write(1, 1)   # KBD
     if window_sequence == 2:
         bw.write(num_sfb & 0xF, 4)
         bw.write(0x7F, 7)
-        sect_esc_val, sect_bits = 7, 3
     else:
         bw.write(num_sfb & 0x3F, 6)
-        bw.write(0, 1)  # predictor = 0
-        sect_esc_val, sect_bits = 31, 5
+        bw.write(0, 1)
 
-    bw.write(0, 2)   # ms_mask_present = 0 (no M/S)
+    if ms_used is None or not np.any(ms_used):
+        bw.write(0, 2)
+    elif np.all(ms_used[:num_sfb]):
+        bw.write(2, 2)
+    else:
+        bw.write(1, 2)
+        for sb in range(num_sfb):
+            bw.write(1 if ms_used[sb] else 0, 1)
 
     _write_ics(bw, q_l, sf_l, gg_l, sections_l, sfb_offsets, num_sfb)
     _write_ics(bw, q_r, sf_r, gg_r, sections_r, sfb_offsets, num_sfb)
 
-    bw.write(7, 3)  # ID_END
+    bw.write(7, 3)
     return bw.flush()
 
 
@@ -734,7 +742,8 @@ def decode_raw_data_block_iso(
     _tag = br.read(4)
 
     if element_id == 1:
-        return decode_cpe_iso(data, sample_rate)[0]
+        ch0, _ch1, _ms = decode_cpe_iso(data, sample_rate)
+        return ch0
 
     # SCE: global_gain + ics_info + ICS body
     global_gain = br.read(8)
@@ -748,8 +757,12 @@ def decode_raw_data_block_iso(
 def decode_cpe_iso(
     data: bytes,
     sample_rate: int = 44100,
-) -> tuple[tuple[np.ndarray, np.ndarray, int], tuple[np.ndarray, np.ndarray, int]]:
-    """Decode a Channel Pair Element. Returns ((q_l, sf_l, gg_l), (q_r, sf_r, gg_r))."""
+) -> tuple[tuple[np.ndarray, np.ndarray, int], tuple[np.ndarray, np.ndarray, int], np.ndarray]:
+    """Decode a Channel Pair Element.
+
+    Returns ((q_l, sf_l, gg_l), (q_r, sf_r, gg_r), ms_used).
+    ms_used: (num_sfb,) bool array.
+    """
     sfb_offsets = get_sfb_offsets(sample_rate)
     num_sfb_max = len(sfb_offsets) - 1
     br = BitReader(data)
@@ -758,12 +771,18 @@ def decode_cpe_iso(
     _tag = br.read(4)
     common_window = br.read(1)
 
+    ms_used = np.zeros(num_sfb_max, dtype=bool)
     if common_window:
         num_sfb, sect_esc_val, sect_bits = _read_ics_info(br, num_sfb_max)
-        _ms_mask = br.read(2)
+        ms_mask_present = br.read(2)
+        if ms_mask_present == 1:
+            for sb in range(num_sfb):
+                ms_used[sb] = bool(br.read(1))
+        elif ms_mask_present == 2:
+            ms_used[:num_sfb] = True
 
     gg0 = br.read(8)
     q0, sf0 = _read_ics_body(br, sfb_offsets, num_sfb, sect_esc_val, sect_bits, gg0)
     gg1 = br.read(8)
     q1, sf1 = _read_ics_body(br, sfb_offsets, num_sfb, sect_esc_val, sect_bits, gg1)
-    return (q0, sf0, gg0), (q1, sf1, gg1)
+    return (q0, sf0, gg0), (q1, sf1, gg1), ms_used

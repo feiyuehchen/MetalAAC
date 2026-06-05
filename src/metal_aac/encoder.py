@@ -97,6 +97,22 @@ class EncoderResult:
     timings: dict[str, float] = field(default_factory=dict)
 
 
+class BitReservoir:
+    __slots__ = ('bits', 'max_bits')
+
+    def __init__(self, num_channels: int = 1):
+        self.bits = 0
+        self.max_bits = 6144 * num_channels
+
+    def update(self, target_bits: int, actual_bits: int) -> None:
+        surplus = target_bits - actual_bits
+        self.bits = max(0, min(self.bits + surplus, self.max_bits))
+
+    @property
+    def fullness(self) -> int:
+        return min(self.bits >> 5, 0x7FE)
+
+
 def _encode_adts_frames(writer, q, sf, gg, window_seqs, config):
     """CPU fallback: encode all frames as ADTS raw_data_blocks."""
     n_frames = len(q)
@@ -128,6 +144,46 @@ def encode(pcm: np.ndarray, config: EncoderConfig | None = None) -> EncoderResul
     if config.use_gpu and HAS_MLX:
         return _encode_gpu(pcm, config)
     return _encode_cpu(pcm, config)
+
+
+def _apply_ms_transform(
+    mdct_l: mx.array, mdct_r: mx.array, sample_rate: int,
+) -> tuple[mx.array, mx.array, np.ndarray]:
+    """Apply per-SFB M/S stereo transform where it reduces side energy.
+
+    Returns (mdct_out_l, mdct_out_r, ms_used) where ms_used is (B, num_sfb) bool.
+    For M/S bands: out_l = (L+R)/sqrt(2) (mid), out_r = (L-R)/sqrt(2) (side).
+    """
+    from metal_aac.tables.scalefactor_bands import get_sfb_offsets
+    sfb_offsets = get_sfb_offsets(sample_rate)
+    num_sfb = len(sfb_offsets) - 1
+    batch = mdct_l.shape[0]
+    sqrt2 = float(np.sqrt(2.0))
+
+    l_np = np.array(mdct_l)
+    r_np = np.array(mdct_r)
+    out_l = l_np.copy()
+    out_r = r_np.copy()
+    ms_used = np.zeros((batch, num_sfb), dtype=bool)
+
+    for sb in range(num_sfb):
+        lo, hi = sfb_offsets[sb], sfb_offsets[sb + 1]
+        l_band = l_np[:, lo:hi]
+        r_band = r_np[:, lo:hi]
+        l_energy = np.sum(l_band ** 2, axis=-1)
+        r_energy = np.sum(r_band ** 2, axis=-1)
+        # ISO M/S: M = (L+R)/2, S = (L-R)/2
+        # Decoder: L = M+S, R = M-S (no normalization)
+        s_band = (l_band - r_band) * 0.5
+        s_energy = np.sum(s_band ** 2, axis=-1)
+        use_ms = (s_energy < l_energy) & (s_energy < r_energy)
+        ms_used[:, sb] = use_ms
+        for b in range(batch):
+            if use_ms[b]:
+                out_l[b, lo:hi] = (l_band[b] + r_band[b]) * 0.5
+                out_r[b, lo:hi] = s_band[b]
+
+    return mx.array(out_l), mx.array(out_r), ms_used
 
 
 def _encode_stereo(pcm_stereo: np.ndarray, config: EncoderConfig) -> EncoderResult:
@@ -182,6 +238,12 @@ def _encode_stereo(pcm_stereo: np.ndarray, config: EncoderConfig) -> EncoderResu
         mx.eval(mask_l, mask_r)
     timings["psychoacoustic"] = t.elapsed
 
+    # M/S stereo transform (before quantization)
+    with Timer() as t:
+        mdct_l, mdct_r, ms_used = _apply_ms_transform(mdct_l, mdct_r, sr)
+        mx.eval(mdct_l, mdct_r)
+    timings["ms_stereo"] = t.elapsed
+
     target = half_config.target_bits_per_frame
     with Timer() as t:
         qr_l = quantize_batch_gpu(mdct_l, mask_l, target, sr)
@@ -208,16 +270,20 @@ def _encode_stereo(pcm_stereo: np.ndarray, config: EncoderConfig) -> EncoderResu
                 qr_r = quantize_batch_gpu(mdct_r, mask_r, corrected, sr)
     timings["quantization"] = t.elapsed
 
+    target_bits_per_frame = half_config.target_bits_per_frame * 2
     with Timer() as t:
         writer = ADTSWriter(sr, 2)
+        reservoir = BitReservoir(num_channels=2)
         for i in range(num_frames):
             rdb = encode_cpe_iso(
                 qr_l.quantized[i], qr_l.scalefactors[i], int(qr_l.global_gain[i]),
                 qr_r.quantized[i], qr_r.scalefactors[i], int(qr_r.global_gain[i]),
                 window_sequence=int(window_seqs[i]),
                 sample_rate=sr,
+                ms_used=ms_used[i],
             )
-            writer.write_frame(rdb)
+            reservoir.update(target_bits_per_frame, len(rdb) * 8)
+            writer.write_frame(rdb, buffer_fullness=reservoir.fullness)
     timings["huffman_bitstream"] = t.elapsed
 
     bitstream = writer.get_bytes()
