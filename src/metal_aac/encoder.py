@@ -354,7 +354,8 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
     num_frames = frames_mx.shape[0]
 
     with Timer() as t:
-        if config.enable_window_switching:
+        use_switching = config.enable_window_switching and config.output_format != "adts"
+        if use_switching:
             raw_frames_mx = frame_signal_mlx(pcm_mx, config.frame_size, config.hop_size)
             transients_mx = detect_transients_gpu(raw_frames_mx)
             mx.eval(transients_mx)
@@ -365,7 +366,7 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
 
     # MDCT: long windows for most frames, short (8x256) for transient frames
     with Timer() as t:
-        has_short = config.enable_window_switching and np.any(window_seqs == 2)
+        has_short = use_switching and np.any(window_seqs == 2)
         if has_short:
             long_mask = (window_seqs != 2)
             short_mask = (window_seqs == 2)

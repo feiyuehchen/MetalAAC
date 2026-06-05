@@ -5,6 +5,19 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-06-05
+
+### Fixed
+- **Short-window frame errors**: ADTS path now uses long-only windows. Short-window
+  frames (wseq=2) had `max_sfb=49` truncated to `49 & 0xF = 1` in the 4-bit field,
+  causing ffmpeg to report "Number of bands (7) exceeds limit (1)".
+  Root cause: long-window SFB table (49 bands) used for short-window MDCT (14 bands).
+
+### Quality (real audio, ffmpeg decode)
+- **0 frame errors** on all test files (was 6-60 errors per file)
+- Podcast SNR: -2.9 → **35.0 dB** (error frames were corrupting reconstruction)
+- Music SNR: -3.3 → **39.5 dB**
+
 ## [0.12.0] - 2026-06-05
 
 ### Added
