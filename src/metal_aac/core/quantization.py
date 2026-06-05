@@ -319,7 +319,7 @@ def quantize_batch_gpu(
     masking_thresholds: mx.array,
     target_bits_per_frame: int,
     sample_rate: int = 44100,
-    max_iterations: int = 12,
+    max_iterations: int = 8,
 ) -> QuantizationResult:
     """ISO-native quantizer with clipping-aware per-band SF allocation.
 

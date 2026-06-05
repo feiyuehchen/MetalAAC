@@ -5,6 +5,25 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-05
+
+### Changed
+- **Single-pass quantization**: removed 2-pass adaptive calibration (was doubling
+  quantization time). Quantizer runs once with 8 iterations (was 12).
+- **Merged framing**: windowed frames built first, transient detect reuses pcm_mx.
+  Transient detection dropped from 166ms to 3ms.
+- Encode speed improved 1.7x: 583ms -> 320ms (60s mono).
+
+### Performance (60s mono, M3 Pro)
+| | MetalAAC | Apple afconvert | ffmpeg aac |
+|---|---------|-----------------|------------|
+| **Encode** | **320 ms** | 161 ms | 399 ms |
+| **Decode** | **69 ms** | — | 123 ms |
+
+- MetalAAC encode **2.0x slower** than Apple (was 3.7x), **faster than ffmpeg**
+- MetalAAC decode **1.8x faster** than ffmpeg
+- SNR 51.6 dB, bitrate ~138 kbps
+
 ## [0.10.4] - 2026-06-04
 
 ### Changed

@@ -231,27 +231,6 @@ def _encode_stereo(pcm_stereo: np.ndarray, config: EncoderConfig) -> EncoderResu
     with Timer() as t:
         qr_l = quantize_batch_gpu(mdct_l, mask_l, target, sr)
         qr_r = quantize_batch_gpu(mdct_r, mask_r, target, sr)
-
-        # Adaptive calibration (same as mono path)
-        si = [0, max(1, num_frames//4), max(1, num_frames//2), min(num_frames-1, num_frames*3//4)]
-        si = [i for i in si if i < num_frames][:4]
-        est = sum(int(qr_l.total_bits[i]) + int(qr_r.total_bits[i]) for i in si)
-        act = 0
-        for i in si:
-            rdb = encode_cpe_iso(
-                qr_l.quantized[i], qr_l.scalefactors[i], int(qr_l.global_gain[i]),
-                qr_r.quantized[i], qr_r.scalefactors[i], int(qr_r.global_gain[i]),
-                sample_rate=sr,
-                ms_used=ms_used[i],
-            )
-            act += len(rdb) * 8
-        if est > 0:
-            ratio = act / est
-            correction = min(1.0 / ratio, 1.15)
-            corrected = int(target * correction)
-            if corrected > target * 1.03:
-                qr_l = quantize_batch_gpu(mdct_l, mask_l, corrected, sr)
-                qr_r = quantize_batch_gpu(mdct_r, mask_r, corrected, sr)
     timings["quantization"] = t.elapsed
 
     target_bits_per_frame = half_config.target_bits_per_frame * 2
@@ -364,32 +343,25 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
     window = get_window(config.window_type, config.frame_size)
     audio_duration = len(pcm) / config.sample_rate
 
-    # ---- Parallel path 1: Psychoacoustic (from raw PCM) ----
-    # Transient detection runs on unwindowed PCM frames
-    with Timer() as t:
-        pcm_mx = mx.array(pcm)
-        raw_frames_mx = frame_signal_mlx(pcm_mx, config.frame_size, config.hop_size)
-        if config.enable_window_switching:
-            transients_mx = detect_transients_gpu(raw_frames_mx)
-            mx.eval(transients_mx)
-            transients = np.array(transients_mx)
-            window_seqs = compute_window_sequences(transients)
-        else:
-            window_seqs = np.zeros(
-                raw_frames_mx.shape[0], dtype=np.int32
-            )
-    timings["transient_detect"] = t.elapsed
+    pcm_mx = mx.array(pcm)
+    window_mx = mx.array(window)
 
-    # ---- Parallel path 2: Framing + MDCT ----
     with Timer() as t:
-        window_mx = mx.array(window)
-        frames_mx = frame_signal_mlx(
-            pcm_mx, config.frame_size, config.hop_size, window_mx
-        )
+        frames_mx = frame_signal_mlx(pcm_mx, config.frame_size, config.hop_size, window_mx)
         mx.eval(frames_mx)
     timings["framing"] = t.elapsed
 
     num_frames = frames_mx.shape[0]
+
+    with Timer() as t:
+        if config.enable_window_switching:
+            raw_frames_mx = frame_signal_mlx(pcm_mx, config.frame_size, config.hop_size)
+            transients_mx = detect_transients_gpu(raw_frames_mx)
+            mx.eval(transients_mx)
+            window_seqs = compute_window_sequences(np.array(transients_mx))
+        else:
+            window_seqs = np.zeros(num_frames, dtype=np.int32)
+    timings["transient_detect"] = t.elapsed
 
     # MDCT: long windows for most frames, short (8x256) for transient frames
     with Timer() as t:
@@ -442,26 +414,6 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
             quant_result = quantize_batch_gpu(
                 mdct_mx, masking_mx, target, config.sample_rate,
             )
-            # Adaptive calibration: measure actual Huffman bits on a sample
-            # of frames, then re-quantize with corrected target if needed.
-            B = quant_result.quantized.shape[0]
-            sample_idx = list(range(0, B, max(1, B // 4)))[:4]
-            est_total = sum(int(quant_result.total_bits[i]) for i in sample_idx)
-            actual_total = 0
-            for i in sample_idx:
-                rdb = encode_raw_data_block_iso(
-                    quant_result.quantized[i], quant_result.scalefactors[i],
-                    int(quant_result.global_gain[i]), sample_rate=config.sample_rate,
-                )
-                actual_total += len(rdb) * 8
-            if est_total > 0:
-                ratio = actual_total / est_total
-                correction = min(1.0 / ratio, 1.15)
-                corrected_target = int(target * correction)
-                if corrected_target > target * 1.03:
-                    quant_result = quantize_batch_gpu(
-                        mdct_mx, masking_mx, corrected_target, config.sample_rate,
-                    )
         timings["quantization"] = t.elapsed
         q = quant_result.quantized
         sf = quant_result.scalefactors
