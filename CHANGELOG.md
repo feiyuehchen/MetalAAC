@@ -5,6 +5,21 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-06-04
+
+### Changed
+- **MLX GPU dequantization** in all decode paths (CPU+GPU mono, stereo).
+  Replaced numpy per-coefficient power with MLX vectorized computation.
+- **MLX GPU IMDCT** in CPU decode path (was using numpy matmul fallback).
+- **Vectorized inverse M/S**: uses `np.where` with sfb_map mask instead of
+  per-SFB × per-frame Python loop.
+- GPU decode path: sfb_map indexing moved from numpy to MLX.
+
+### Performance
+- Decode 60s: **102 → 57 ms** GPU, **102 → 61 ms** CPU
+- Dequantization: **45 → 7 ms** (MLX GPU)
+- Total decode speedup from v0.10.1: **42x** (2386 → 57 ms)
+
 ## [0.10.3] - 2026-06-04
 
 ### Added

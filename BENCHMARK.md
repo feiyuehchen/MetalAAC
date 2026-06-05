@@ -255,14 +255,15 @@ Notes:
 
 | Mode | 10s | 60s | 300s | Bottleneck |
 |------|-----|-----|------|-----------|
-| **CPU decode** | 401 ms | 2386 ms | 12894 ms | Huffman parsing 88% |
-| **GPU decode** | 358 ms | 2155 ms | 11584 ms | Huffman parsing 88% |
+| **v0.10.1 Python** | 401 ms | 2386 ms | 12894 ms | Huffman 88% |
+| **v0.10.3 Native C** | — | 102 ms | — | dequant 45ms |
+| **v0.10.4 +MLX** | — | **57 ms** | **1756 ms** | imdct 20ms |
 
 Notes:
-- Decoder is ~40x slower than real-time. Bottleneck is Python bit-by-bit
-  Huffman tree traversal (88% of time). Dequantization is 11%.
-- GPU decode only accelerates IMDCT/dequant, not Huffman parsing.
-- For playback use cases, ffmpeg decode is recommended.
+- 42x total speedup from v0.10.1 to v0.10.4.
+- Native C+GCD Huffman decode: ~0ms (LUT, multi-core parallel).
+- MLX GPU dequantization: 7ms (was 45ms numpy).
+- Remaining: IMDCT 20ms (MLX matmul), overlap-add 4ms (numpy).
 
 ### Encoder Stage Breakdown (60s mono ADTS)
 
