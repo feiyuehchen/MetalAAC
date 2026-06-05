@@ -339,6 +339,9 @@ def _encode_cpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
 
 
 def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
+    from metal_aac.core.metal_bridge import has_metal, metal
+    use_metal = has_metal()
+
     timings = {}
     window = get_window(config.window_type, config.frame_size)
     audio_duration = len(pcm) / config.sample_rate
@@ -413,8 +416,13 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
         with Timer() as t:
             target = config.target_bits_per_frame
             from metal_aac.tables.scalefactor_bands import get_sfb_offsets, get_sfb_offsets_short
-            from metal_aac.core.metal_bridge import MetalHuffman
             mdct_np = np.array(mdct_mx)
+
+            def _quantize(coeffs, tgt, sr, custom_offsets=None):
+                if use_metal:
+                    return metal().quantize_iso(coeffs, tgt, sr, custom_sfb_offsets=custom_offsets)
+                r = quantize_batch_gpu(mx.array(coeffs), masking_mx[:coeffs.shape[0]], tgt, sr)
+                return r.quantized, r.scalefactors, r.global_gain, r.total_bits
 
             if has_short:
                 from metal_aac.core.quantization import reorder_short_to_iso
@@ -425,74 +433,39 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
                 q = np.zeros((num_frames, config.n_coeffs), dtype=np.int32)
                 num_sfb_long = len(get_sfb_offsets(config.sample_rate)) - 1
                 num_sfb_short = len(short_sfb) - 1
-                max_sfb = max(num_sfb_long, num_sfb_short)
-                sf = np.full((num_frames, max_sfb), 200, dtype=np.int32)
+                sf = np.full((num_frames, max(num_sfb_long, num_sfb_short)), 200, dtype=np.int32)
                 gg = np.zeros(num_frames, dtype=np.int32)
 
                 if len(long_idx) > 0:
-                    try:
-                        metal_q = MetalHuffman.shared()
-                        ql, sfl, ggl, _ = metal_q.quantize_iso(
-                            mdct_np[long_idx], target, config.sample_rate)
-                    except (OSError, RuntimeError, FileNotFoundError):
-                        r = quantize_batch_gpu(mx.array(mdct_np[long_idx]),
-                            masking_mx[long_idx] if masking_mx.shape[0] > 1 else masking_mx,
-                            target, config.sample_rate)
-                        ql, sfl, ggl = r.quantized, r.scalefactors, r.global_gain
+                    ql, sfl, ggl, _ = _quantize(mdct_np[long_idx], target, config.sample_rate)
                     q[long_idx] = ql
                     sf[long_idx, :num_sfb_long] = sfl
                     gg[long_idx] = ggl
 
                 if len(short_idx) > 0:
-                    short_flat = mdct_np[short_idx]
-                    short_reordered, iso_offsets = reorder_short_to_iso(short_flat, short_sfb)
-                    try:
-                        metal_q = MetalHuffman.shared()
-                        qs, sfs, ggs, _ = metal_q.quantize_iso(
-                            short_reordered, target, config.sample_rate,
-                            custom_sfb_offsets=iso_offsets)
-                    except (OSError, RuntimeError, FileNotFoundError):
-                        r = quantize_batch_gpu(mx.array(short_reordered),
-                            masking_mx[short_idx] if masking_mx.shape[0] > 1 else masking_mx,
-                            target, config.sample_rate)
-                        qs, sfs, ggs = r.quantized, r.scalefactors, r.global_gain
+                    short_reordered, iso_offsets = reorder_short_to_iso(mdct_np[short_idx], short_sfb)
+                    qs, sfs, ggs, _ = _quantize(short_reordered, target, config.sample_rate, iso_offsets)
                     q[short_idx] = qs
                     sf[short_idx, :sfs.shape[1]] = sfs
                     gg[short_idx] = ggs
             else:
-                try:
-                    metal_q = MetalHuffman.shared()
-                    q, sf, gg, _ = metal_q.quantize_iso(
-                        mdct_np, target, config.sample_rate)
-                except (OSError, RuntimeError, FileNotFoundError):
-                    quant_result = quantize_batch_gpu(
-                        mdct_mx, masking_mx, target, config.sample_rate)
-                    q, sf, gg = quant_result.quantized, quant_result.scalefactors, quant_result.global_gain
+                q, sf, gg, _ = _quantize(mdct_np, target, config.sample_rate)
         timings["quantization"] = t.elapsed
     else:
         # Legacy quantizer for internal round-trip
-        try:
-            from metal_aac.core.metal_bridge import MetalHuffman
-            metal = MetalHuffman.shared()
-            with Timer() as t:
+        with Timer() as t:
+            if use_metal:
                 mdct_np = np.array(mdct_mx)
                 masking_np = np.array(masking_mx)
-                q, sf, gg, _ = metal.quantize(
+                q, sf, gg, _ = metal().quantize(
                     mdct_np, masking_np,
-                    config.target_bits_per_frame, config.sample_rate,
-                )
-            timings["quantization"] = t.elapsed
-        except (OSError, RuntimeError, FileNotFoundError):
-            # CPU fallback with old formula
-            with Timer() as t:
+                    config.target_bits_per_frame, config.sample_rate)
+            else:
                 quant_result = quantize_cpu(
                     np.array(mdct_mx), np.array(masking_mx),
-                    config.target_bits_per_frame, config.sample_rate,
-                )
-            timings["quantization"] = t.elapsed
-            q = quant_result.quantized
-            sf = quant_result.scalefactors
-            gg = quant_result.global_gain
+                    config.target_bits_per_frame, config.sample_rate)
+                q, sf, gg = quant_result.quantized, quant_result.scalefactors, quant_result.global_gain
+        timings["quantization"] = t.elapsed
 
     # ---- Huffman + bitstream assembly ----
     with Timer() as t:
@@ -516,31 +489,24 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
                         )
                     writer.write_frame(rdb)
             else:
-                try:
-                    from metal_aac.core.metal_bridge import MetalHuffman
-                    metal = MetalHuffman.shared()
-                    encoded_frames = metal.encode_adts_frames(
-                        q, sf, gg, window_seqs, config.sample_rate,
-                    )
+                if use_metal:
+                    encoded_frames = metal().encode_adts_frames(
+                        q, sf, gg, window_seqs, config.sample_rate)
                     for rdb in encoded_frames:
                         writer.write_frame(rdb)
-                except (OSError, RuntimeError, FileNotFoundError):
+                else:
                     for i in range(len(q)):
                         rdb = encode_raw_data_block_iso(
                             q[i], sf[i], int(gg[i]),
                             window_sequence=int(window_seqs[i]),
-                            sample_rate=config.sample_rate,
-                        )
+                            sample_rate=config.sample_rate)
                         writer.write_frame(rdb)
         else:
-            try:
-                from metal_aac.core.metal_bridge import MetalHuffman
-                metal = MetalHuffman.shared()
-                encoded_frames = metal.encode_frames(q, sf, gg)
-            except (OSError, RuntimeError, FileNotFoundError):
+            if use_metal:
+                encoded_frames = metal().encode_frames(q, sf, gg)
+            else:
                 encoded_frames = encode_frames_parallel(
-                    q, sf, gg, config.sample_rate,
-                )
+                    q, sf, gg, config.sample_rate)
             writer = BitstreamWriter()
             num_sfb = get_num_sfb(config.sample_rate)
             for spectral_bytes in encoded_frames:

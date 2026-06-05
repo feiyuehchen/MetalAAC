@@ -251,26 +251,22 @@ def _decode_cpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
             )
 
         if is_adts:
-            try:
-                from metal_aac.core.metal_bridge import MetalHuffman
-                metal = MetalHuffman.shared()
+            from metal_aac.core.metal_bridge import has_metal, metal as get_metal
+            if has_metal():
                 payloads = [p for (p,) in parsed_frames]
-                all_q, all_sf, all_gg = metal.decode_iso_frames(
-                    payloads, sample_rate, config.frame_size // 2
-                )
-                timings["huffman_bitstream"] = t.elapsed
+                all_q, all_sf, all_gg = get_metal().decode_iso_frames(
+                    payloads, sample_rate, config.frame_size // 2)
                 decoded_frames = [
                     (all_q[i], all_sf[i], int(all_gg[i]))
                     for i in range(len(payloads))
                 ]
-            except (OSError, RuntimeError, FileNotFoundError):
+            else:
                 decoded_frames = []
                 for (payload,) in parsed_frames:
                     quantized, scalefactors, global_gain = decode_raw_data_block_iso(
-                        payload, sample_rate
-                    )
+                        payload, sample_rate)
                     decoded_frames.append((quantized, scalefactors, global_gain))
-                timings["huffman_bitstream"] = t.elapsed
+            timings["huffman_bitstream"] = t.elapsed
         else:
             decoded_frames = []
             for (payload,) in parsed_frames:
@@ -321,20 +317,18 @@ def _decode_gpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
             return DecoderResult(pcm=pcm, sample_rate=sample_rate,
                                 num_frames=len(parsed_frames), timings=timings)
 
+        from metal_aac.core.metal_bridge import has_metal, metal as get_metal
+        _use_metal = has_metal()
         if is_adts:
-            try:
-                from metal_aac.core.metal_bridge import MetalHuffman
-                metal = MetalHuffman.shared()
+            if _use_metal:
                 payloads = [p for (p,) in parsed_frames]
-                all_quantized, all_sf, all_gain = metal.decode_iso_frames(
-                    payloads, sample_rate, n_coeffs
-                )
-            except (OSError, RuntimeError, FileNotFoundError):
+                all_quantized, all_sf, all_gain = get_metal().decode_iso_frames(
+                    payloads, sample_rate, n_coeffs)
+            else:
                 decoded_frames = []
                 for (payload,) in parsed_frames:
                     quantized, scalefactors, global_gain = decode_raw_data_block_iso(
-                        payload, sample_rate
-                    )
+                        payload, sample_rate)
                     decoded_frames.append((quantized, scalefactors, global_gain))
                 all_quantized = np.zeros((len(decoded_frames), n_coeffs), dtype=np.int32)
                 all_sf = np.zeros((len(decoded_frames), num_sfb), dtype=np.int32)
@@ -344,12 +338,11 @@ def _decode_gpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
                     all_sf[i, :len(sf)] = sf[:num_sfb]
                     all_gain[i] = g
         else:
-            try:
+            if _use_metal:
                 payloads = [p for (p,) in parsed_frames]
                 all_quantized, all_sf, all_gain = decode_frames_metal(
-                    payloads, n_coeffs, num_sfb
-                )
-            except (OSError, RuntimeError, FileNotFoundError):
+                    payloads, n_coeffs, num_sfb)
+            else:
                 decoded_frames = []
                 for (payload,) in parsed_frames:
                     quantized, scalefactors, global_gain = decode_spectral_data(

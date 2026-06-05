@@ -12,6 +12,25 @@ _LIB_PATH = Path(__file__).resolve().parent.parent.parent.parent / "metal" / "li
 _c_int32_p = ctypes.POINTER(ctypes.c_int32)
 _c_uint8_p = ctypes.POINTER(ctypes.c_uint8)
 
+_metal_available: bool | None = None
+
+
+def has_metal() -> bool:
+    """Check if Metal native library is available (cached)."""
+    global _metal_available
+    if _metal_available is None:
+        try:
+            MetalHuffman.shared()
+            _metal_available = True
+        except (OSError, RuntimeError, FileNotFoundError):
+            _metal_available = False
+    return _metal_available
+
+
+def metal() -> MetalHuffman:
+    """Get the Metal singleton. Call has_metal() first to check availability."""
+    return MetalHuffman.shared()
+
 
 class MetalHuffman:
     _instance: MetalHuffman | None = None
