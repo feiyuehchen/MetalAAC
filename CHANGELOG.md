@@ -5,6 +5,25 @@ DATASET.md and BENCHMARK.md changes trigger MAJOR bumps.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-06-04
+
+### Fixed
+- **`_write_ics` wrong window detection**: was checking codebook index instead of
+  window_sequence for short/long section encoding. Added `window_sequence` parameter.
+- **`decode_cpe_iso` crash on common_window=0**: unbound variables when ics_info
+  is per-channel. Now reads per-channel ics_info when common_window=0.
+- **Stereo encode crash without MLX**: raises clear error instead of NameError.
+- **`global_gain` DPCM anchor bias**: was averaging ALL SFBs including zero-codebook
+  bands. Now averages only non-zero bands, reducing wasted DPCM Huffman bits.
+- **Stereo calibration missing ms_used**: calibration sample frames now include M/S
+  flag bits, matching final encoding.
+- **M/S docstring + dead code**: removed unused `sqrt2`, corrected docstring to
+  match ISO convention `M=(L+R)/2, S=(L-R)/2`.
+- **M/S GPU roundtrip**: replaced NumPy loop with MLX vectorized `mx.where` —
+  stays on GPU, no CPU transfer.
+- Removed dead `_encode_adts_frames` function (legacy format, never called).
+- Documented `masking_thresholds` as reserved/unused in `quantize_batch_gpu`.
+
 ## [0.10.0] - 2026-06-04
 
 ### Added

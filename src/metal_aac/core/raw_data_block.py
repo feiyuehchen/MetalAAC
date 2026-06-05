@@ -276,11 +276,12 @@ def _write_ics(
     sections: list,
     sfb_offsets: list[int],
     num_sfb: int,
+    window_sequence: int = 0,
 ) -> None:
     """Write an individual_channel_stream (no ics_info — caller writes it)."""
     bw.write(iso_global_gain & 0xFF, 8)
 
-    if sections[0][2] == 2:  # short window
+    if window_sequence == 2:
         sect_esc_val, sect_bits = 7, 3
     else:
         sect_esc_val, sect_bits = 31, 5
@@ -381,8 +382,8 @@ def encode_cpe_iso(
         for sb in range(num_sfb):
             bw.write(1 if ms_used[sb] else 0, 1)
 
-    _write_ics(bw, q_l, sf_l, gg_l, sections_l, sfb_offsets, num_sfb)
-    _write_ics(bw, q_r, sf_r, gg_r, sections_r, sfb_offsets, num_sfb)
+    _write_ics(bw, q_l, sf_l, gg_l, sections_l, sfb_offsets, num_sfb, window_sequence)
+    _write_ics(bw, q_r, sf_r, gg_r, sections_r, sfb_offsets, num_sfb, window_sequence)
 
     bw.write(7, 3)
     return bw.flush()
@@ -782,7 +783,11 @@ def decode_cpe_iso(
             ms_used[:num_sfb] = True
 
     gg0 = br.read(8)
+    if not common_window:
+        num_sfb, sect_esc_val, sect_bits = _read_ics_info(br, num_sfb_max)
     q0, sf0 = _read_ics_body(br, sfb_offsets, num_sfb, sect_esc_val, sect_bits, gg0)
     gg1 = br.read(8)
+    if not common_window:
+        num_sfb, sect_esc_val, sect_bits = _read_ics_info(br, num_sfb_max)
     q1, sf1 = _read_ics_body(br, sfb_offsets, num_sfb, sect_esc_val, sect_bits, gg1)
     return (q0, sf0, gg0), (q1, sf1, gg1), ms_used

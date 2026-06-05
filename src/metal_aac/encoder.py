@@ -54,7 +54,7 @@ from metal_aac.core.psychoacoustic import (
     psychoacoustic_cpu,
     psychoacoustic_gpu,
 )
-from metal_aac.core.quantization import quantize_batch_gpu, quantize_cpu
+from metal_aac.core.quantization import quantize_batch_gpu, quantize_cpu, _build_sfb_map
 from metal_aac.core.window_switching import (
     WindowSequence,
     compute_window_sequences,
@@ -113,18 +113,6 @@ class BitReservoir:
         return min(self.bits >> 5, 0x7FE)
 
 
-def _encode_adts_frames(writer, q, sf, gg, window_seqs, config):
-    """CPU fallback: encode all frames as ADTS raw_data_blocks."""
-    n_frames = len(q)
-    for i in range(n_frames):
-        rdb = encode_raw_data_block(
-            q[i], sf[i], int(gg[i]),
-            window_sequence=int(window_seqs[i]),
-            sample_rate=config.sample_rate,
-        )
-        writer.write_frame(rdb)
-
-
 def encode(pcm: np.ndarray, config: EncoderConfig | None = None) -> EncoderResult:
     """Encode PCM audio to AAC bitstream.
 
@@ -136,6 +124,8 @@ def encode(pcm: np.ndarray, config: EncoderConfig | None = None) -> EncoderResul
 
     pcm = np.asarray(pcm, dtype=np.float32)
     if pcm.ndim == 2 and pcm.shape[1] == 2:
+        if not HAS_MLX:
+            raise RuntimeError("Stereo encoding requires MLX (Apple Silicon only)")
         return _encode_stereo(pcm, config)
 
     if pcm.ndim == 2 and pcm.shape[1] == 1:
@@ -152,38 +142,35 @@ def _apply_ms_transform(
     """Apply per-SFB M/S stereo transform where it reduces side energy.
 
     Returns (mdct_out_l, mdct_out_r, ms_used) where ms_used is (B, num_sfb) bool.
-    For M/S bands: out_l = (L+R)/sqrt(2) (mid), out_r = (L-R)/sqrt(2) (side).
+    ISO convention: M = (L+R)/2, S = (L-R)/2. Decoder: L = M+S, R = M-S.
     """
     from metal_aac.tables.scalefactor_bands import get_sfb_offsets
     sfb_offsets = get_sfb_offsets(sample_rate)
     num_sfb = len(sfb_offsets) - 1
     batch = mdct_l.shape[0]
-    sqrt2 = float(np.sqrt(2.0))
 
-    l_np = np.array(mdct_l)
-    r_np = np.array(mdct_r)
-    out_l = l_np.copy()
-    out_r = r_np.copy()
-    ms_used = np.zeros((batch, num_sfb), dtype=bool)
+    mid = (mdct_l + mdct_r) * 0.5
+    side = (mdct_l - mdct_r) * 0.5
 
+    l_energy = mx.zeros((batch, num_sfb))
+    r_energy = mx.zeros((batch, num_sfb))
+    s_energy = mx.zeros((batch, num_sfb))
     for sb in range(num_sfb):
         lo, hi = sfb_offsets[sb], sfb_offsets[sb + 1]
-        l_band = l_np[:, lo:hi]
-        r_band = r_np[:, lo:hi]
-        l_energy = np.sum(l_band ** 2, axis=-1)
-        r_energy = np.sum(r_band ** 2, axis=-1)
-        # ISO M/S: M = (L+R)/2, S = (L-R)/2
-        # Decoder: L = M+S, R = M-S (no normalization)
-        s_band = (l_band - r_band) * 0.5
-        s_energy = np.sum(s_band ** 2, axis=-1)
-        use_ms = (s_energy < l_energy) & (s_energy < r_energy)
-        ms_used[:, sb] = use_ms
-        for b in range(batch):
-            if use_ms[b]:
-                out_l[b, lo:hi] = (l_band[b] + r_band[b]) * 0.5
-                out_r[b, lo:hi] = s_band[b]
+        l_energy = l_energy.at[:, sb].add(mx.sum(mdct_l[:, lo:hi] ** 2, axis=-1))
+        r_energy = r_energy.at[:, sb].add(mx.sum(mdct_r[:, lo:hi] ** 2, axis=-1))
+        s_energy = s_energy.at[:, sb].add(mx.sum(side[:, lo:hi] ** 2, axis=-1))
 
-    return mx.array(out_l), mx.array(out_r), ms_used
+    use_ms = (s_energy < l_energy) & (s_energy < r_energy)
+    mx.eval(use_ms)
+    ms_used = np.array(use_ms)
+
+    sfb_map_mx = mx.array(_build_sfb_map(sfb_offsets, int(mdct_l.shape[1])))
+    ms_mask = use_ms[:, sfb_map_mx]
+    out_l = mx.where(ms_mask, mid, mdct_l)
+    out_r = mx.where(ms_mask, side, mdct_r)
+
+    return out_l, out_r, ms_used
 
 
 def _encode_stereo(pcm_stereo: np.ndarray, config: EncoderConfig) -> EncoderResult:
@@ -209,12 +196,8 @@ def _encode_stereo(pcm_stereo: np.ndarray, config: EncoderConfig) -> EncoderResu
     timings: dict[str, float] = {}
 
     with Timer() as t:
-        if HAS_MLX:
-            frames_l = frame_signal_mlx(mx.array(pcm_l), config.frame_size, config.hop_size, window_mx)
-            frames_r = frame_signal_mlx(mx.array(pcm_r), config.frame_size, config.hop_size, window_mx)
-        else:
-            frames_l = mx.array(frame_signal(pcm_l, config.frame_size, config.hop_size, window))
-            frames_r = mx.array(frame_signal(pcm_r, config.frame_size, config.hop_size, window))
+        frames_l = frame_signal_mlx(mx.array(pcm_l), config.frame_size, config.hop_size, window_mx)
+        frames_r = frame_signal_mlx(mx.array(pcm_r), config.frame_size, config.hop_size, window_mx)
     timings["framing"] = t.elapsed
 
     num_frames = int(frames_l.shape[0])
@@ -259,6 +242,7 @@ def _encode_stereo(pcm_stereo: np.ndarray, config: EncoderConfig) -> EncoderResu
                 qr_l.quantized[i], qr_l.scalefactors[i], int(qr_l.global_gain[i]),
                 qr_r.quantized[i], qr_r.scalefactors[i], int(qr_r.global_gain[i]),
                 sample_rate=sr,
+                ms_used=ms_used[i],
             )
             act += len(rdb) * 8
         if est > 0:
