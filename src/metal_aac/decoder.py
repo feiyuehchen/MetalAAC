@@ -117,7 +117,16 @@ def _decode_channel(
         all_gain[i] = g
 
     with Timer() as t:
-        if is_adts:
+        if is_adts and HAS_MLX:
+            from metal_aac.core.quantization import _build_sfb_map
+            sfb_map = _build_sfb_map(get_sfb_offsets(sample_rate), n_coeffs)
+            sf_mx = mx.array(all_sf[:, sfb_map]).astype(mx.float32)
+            scale_mx = mx.power(2.0, (sf_mx - 200.0) / 4.0)
+            q_mx = mx.array(all_q).astype(mx.float32)
+            mdct_mx = mx.sign(q_mx) * mx.power(mx.abs(q_mx), 4.0/3.0) * scale_mx
+            mx.eval(mdct_mx)
+            mdct = np.array(mdct_mx)
+        elif is_adts:
             mdct = dequantize_iso_cpu(all_q, all_sf, sample_rate)
         else:
             mdct = dequantize_cpu(all_q, all_sf, all_gain, sample_rate)
@@ -125,8 +134,12 @@ def _decode_channel(
         timings["dequantization"] = timings.get("dequantization", 0) + t.elapsed
 
     with Timer() as t:
-        basis = MDCTBasis.create(config.frame_size)
-        time_frames = imdct_cpu(mdct, basis)
+        if HAS_MLX:
+            basis_gpu = MDCTBasisGPU(config.frame_size)
+            time_frames = np.array(imdct_gpu(mx.array(mdct), basis_gpu))
+        else:
+            basis = MDCTBasis.create(config.frame_size)
+            time_frames = imdct_cpu(mdct, basis)
     if timings is not None:
         timings["imdct"] = timings.get("imdct", 0) + t.elapsed
 
@@ -160,23 +173,37 @@ def _decode_stereo_channels(
         all_sf_r[i, :len(sfr)] = sfr[:num_sfb]
 
     with Timer() as t:
-        mdct_l = dequantize_iso_cpu(all_q_l, all_sf_l, sample_rate)
-        mdct_r = dequantize_iso_cpu(all_q_r, all_sf_r, sample_rate)
-        for i in range(num_frames):
-            for sb in range(min(num_sfb, len(sfb_offsets) - 1)):
-                if ms_used_list[i][sb]:
-                    lo, hi = sfb_offsets[sb], min(sfb_offsets[sb + 1], n_coeffs)
-                    m = mdct_l[i, lo:hi].copy()
-                    s = mdct_r[i, lo:hi].copy()
-                    mdct_l[i, lo:hi] = m + s
-                    mdct_r[i, lo:hi] = m - s
+        from metal_aac.core.quantization import _build_sfb_map
+        sfb_map = _build_sfb_map(sfb_offsets, n_coeffs)
+
+        sf_l_coeff = all_sf_l[:, sfb_map].astype(np.float32)
+        sf_r_coeff = all_sf_r[:, sfb_map].astype(np.float32)
+        scale_l = np.power(2.0, (sf_l_coeff - 200.0) / 4.0)
+        scale_r = np.power(2.0, (sf_r_coeff - 200.0) / 4.0)
+
+        ql = all_q_l.astype(np.float32)
+        qr = all_q_r.astype(np.float32)
+        mdct_l = np.sign(ql) * np.power(np.abs(ql), 4.0/3.0) * scale_l
+        mdct_r = np.sign(qr) * np.power(np.abs(qr), 4.0/3.0) * scale_r
+
+        ms_mask = np.stack([m[:num_sfb] for m in ms_used_list])
+        ms_coeff_mask = ms_mask[:, sfb_map]
+        m_save = mdct_l.copy()
+        mdct_l = np.where(ms_coeff_mask, m_save + mdct_r, mdct_l)
+        mdct_r = np.where(ms_coeff_mask, m_save - mdct_r, mdct_r)
     if timings is not None:
         timings["dequantization"] = timings.get("dequantization", 0) + t.elapsed
 
     with Timer() as t:
-        basis = MDCTBasis.create(config.frame_size)
-        tf_l = imdct_cpu(mdct_l, basis)
-        tf_r = imdct_cpu(mdct_r, basis)
+        if HAS_MLX:
+            basis = MDCTBasisGPU(config.frame_size)
+            tf_l = np.array(imdct_gpu(mx.array(mdct_l), basis))
+            tf_r = np.array(imdct_gpu(mx.array(mdct_r), basis))
+            mx.eval(mx.array(0))
+        else:
+            basis = MDCTBasis.create(config.frame_size)
+            tf_l = imdct_cpu(mdct_l, basis)
+            tf_r = imdct_cpu(mdct_r, basis)
     if timings is not None:
         timings["imdct"] = timings.get("imdct", 0) + t.elapsed
 
@@ -350,13 +377,11 @@ def _decode_gpu(bitstream: bytes, config: DecoderConfig) -> DecoderResult:
         abs_q = mx.abs(q_float)
 
         if is_adts:
-            sfb_map = np.zeros(n_coeffs, dtype=np.int32)
-            for sb in range(min(num_sfb, len(sfb_offsets) - 1)):
-                lo, hi = sfb_offsets[sb], min(sfb_offsets[sb + 1], n_coeffs)
-                sfb_map[lo:hi] = sb
-            per_coeff_sf = all_sf[:, sfb_map].astype(np.float32)
-            scale = np.power(2.0, (per_coeff_sf - 200.0) / 4.0)
-            mdct_mx = signs * mx.power(abs_q, 4.0 / 3.0) * mx.array(scale)
+            from metal_aac.core.quantization import _build_sfb_map
+            sfb_map = _build_sfb_map(sfb_offsets, n_coeffs)
+            sf_mx = mx.array(all_sf[:, sfb_map]).astype(mx.float32)
+            scale_mx = mx.power(2.0, (sf_mx - 200.0) / 4.0)
+            mdct_mx = signs * mx.power(abs_q, 4.0 / 3.0) * scale_mx
         else:
             all_inv_gains = np.zeros((num_frames, n_coeffs), dtype=np.float32)
             for i in range(num_frames):
