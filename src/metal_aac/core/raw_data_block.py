@@ -364,8 +364,19 @@ def encode_cpe_iso(
 
     ms_used: (num_sfb,) bool — which SFBs use M/S coding. None = no M/S.
     """
-    sfb_offsets = get_sfb_offsets(sample_rate)
-    num_sfb = len(sfb_offsets) - 1
+    if window_sequence == 2:
+        from metal_aac.tables.scalefactor_bands import get_sfb_offsets_short
+        short_sfb = get_sfb_offsets_short(sample_rate)
+        num_sfb_short = len(short_sfb) - 1
+        num_win = 8
+        sfb_offsets = [0]
+        for sb in range(num_sfb_short):
+            w = (short_sfb[sb + 1] - short_sfb[sb]) * num_win
+            sfb_offsets.append(sfb_offsets[-1] + w)
+        num_sfb = num_sfb_short
+    else:
+        sfb_offsets = get_sfb_offsets(sample_rate)
+        num_sfb = len(sfb_offsets) - 1
 
     sections_l = _compute_sections(np.clip(q_l, -255, 255), sfb_offsets)
     sections_r = _compute_sections(np.clip(q_r, -255, 255), sfb_offsets)
@@ -654,7 +665,7 @@ def _get_value_table(dim: int, signed: bool, max_abs: int) -> list:
 
 def _read_escape(br: BitReader) -> int:
     count = 0
-    while br.read1() == 1:
+    while br.read1() == 1 and count < 24:
         count += 1
     return (1 << (count + 4)) | br.read(count + 4)
 

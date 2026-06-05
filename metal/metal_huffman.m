@@ -736,7 +736,7 @@ static void decode_one_frame(
         prev_sf += idx - 60;
         sf_out[sb] = prev_sf;
     }
-    for (int sb = max_sfb; sb < num_sfb; sb++) sf_out[sb] = prev_sf;
+    for (int sb = max_sfb; sb < num_sfb; sb++) sf_out[sb] = 0;
 
     // pulse/tns/gain
     pos += 3;
@@ -780,7 +780,7 @@ static void decode_one_frame(
                         if (av >= 16) {
                             int sign = vals[d] < 0 ? -1 : 1;
                             int cnt = 0;
-                            while (bits_read(payload, &pos, 1, total_bits) == 1) cnt++;
+                            while (bits_read(payload, &pos, 1, total_bits) == 1 && cnt < 24) cnt++;
                             int esc_val = (1 << (cnt + 4)) | bits_read(payload, &pos, cnt + 4, total_bits);
                             vals[d] = sign * esc_val;
                         }

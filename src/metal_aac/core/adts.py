@@ -55,6 +55,8 @@ def write_adts_header(
     Returns 7 bytes.
     """
     frame_length = ADTS_HEADER_SIZE + raw_data_block_size
+    if frame_length > 8191:
+        raise ValueError(f"ADTS frame too large: {frame_length} bytes (max 8191)")
     sf_index = SAMPLING_FREQ_TABLE.get(sample_rate, 4)
 
     # Byte 0-1: syncword(12) + id(1) + layer(2) + protection_absent(1)
