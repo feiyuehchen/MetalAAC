@@ -88,6 +88,19 @@ int metal_decode_iso_frames(
     int32_t* global_gains_out
 );
 
+int metal_quantize_iso(
+    MetalHuffmanCtx* ctx,
+    const float* mdct_coeffs,
+    const int32_t* sfb_offsets,
+    const int32_t* sfb_map,
+    int32_t B, int32_t N, int32_t num_sfb,
+    int32_t target_bits, int32_t max_iterations,
+    int32_t* quantized_out,
+    int32_t* sf_out,
+    int32_t* gg_out,
+    int32_t* bits_out
+);
+
 int metal_huffman_quantize(
     MetalHuffmanCtx* ctx,
     const float* mdct_coeffs,

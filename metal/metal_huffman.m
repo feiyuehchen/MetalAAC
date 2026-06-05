@@ -16,6 +16,7 @@ struct MetalHuffmanCtx {
     void* pso_scatter;
     void* pso_decode;
     void* pso_quantize;
+    void* pso_quantize_iso;
     void* pso_compute_sf;
     void* pso_encode_rdb;
 };
@@ -128,6 +129,10 @@ MetalHuffmanCtx* metal_huffman_create(void) {
         if (!p) goto fail;
         ctx->pso_quantize = _retain(p);
 
+        p = _make_pso(device, library, "kernel_quantize_iso");
+        if (!p) goto fail;
+        ctx->pso_quantize_iso = _retain(p);
+
         p = _make_pso(device, library, "kernel_compute_scalefactors");
         if (!p) goto fail;
         ctx->pso_compute_sf = _retain(p);
@@ -154,6 +159,7 @@ void metal_huffman_destroy(MetalHuffmanCtx* ctx) {
     if (ctx->pso_scatter)  CFBridgingRelease(ctx->pso_scatter);
     if (ctx->pso_decode)   CFBridgingRelease(ctx->pso_decode);
     if (ctx->pso_quantize) CFBridgingRelease(ctx->pso_quantize);
+    if (ctx->pso_quantize_iso) CFBridgingRelease(ctx->pso_quantize_iso);
     if (ctx->pso_compute_sf) CFBridgingRelease(ctx->pso_compute_sf);
     if (ctx->pso_encode_rdb) CFBridgingRelease(ctx->pso_encode_rdb);
     free(ctx);
@@ -784,6 +790,64 @@ static void decode_one_frame(
 
             for (int d = 0; d < dim && (i+d) < N; d++) q_out[i+d] = vals[d];
         }
+    }
+}
+
+int metal_quantize_iso(
+    MetalHuffmanCtx* ctx,
+    const float* mdct_coeffs,
+    const int32_t* sfb_offsets,
+    const int32_t* sfb_map,
+    int32_t B, int32_t N, int32_t num_sfb,
+    int32_t target_bits, int32_t max_iterations,
+    int32_t* quantized_out,
+    int32_t* sf_out,
+    int32_t* gg_out,
+    int32_t* bits_out)
+{
+    @autoreleasepool {
+        id<MTLDevice> device = DEV(ctx);
+        size_t coeff_size = (size_t)B * N * sizeof(float);
+        size_t sfb_off_size = ((size_t)num_sfb + 1) * sizeof(int32_t);
+        size_t map_size = (size_t)N * sizeof(int32_t);
+        size_t q_size = (size_t)B * N * sizeof(int32_t);
+        size_t sf_size = (size_t)B * num_sfb * sizeof(int32_t);
+
+        id<MTLBuffer> buf_coeffs = [device newBufferWithBytes:mdct_coeffs length:coeff_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_sfb_off = [device newBufferWithBytes:sfb_offsets length:sfb_off_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_map = [device newBufferWithBytes:sfb_map length:map_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_q = [device newBufferWithLength:q_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_sf = [device newBufferWithLength:sf_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_gg = [device newBufferWithLength:B*sizeof(int32_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_bits = [device newBufferWithLength:B*sizeof(int32_t) options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cmd = [QUEUE(ctx) commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cmd computeCommandEncoder];
+        [e setComputePipelineState:PSO(ctx->pso_quantize_iso)];
+        [e setBuffer:buf_coeffs offset:0 atIndex:0];
+        [e setBuffer:buf_sfb_off offset:0 atIndex:1];
+        [e setBuffer:buf_map offset:0 atIndex:2];
+        [e setBuffer:buf_q offset:0 atIndex:3];
+        [e setBuffer:buf_sf offset:0 atIndex:4];
+        [e setBuffer:buf_gg offset:0 atIndex:5];
+        [e setBuffer:buf_bits offset:0 atIndex:6];
+        [e setBytes:&N length:4 atIndex:7];
+        [e setBytes:&num_sfb length:4 atIndex:8];
+        [e setBytes:&target_bits length:4 atIndex:9];
+        [e setBytes:&max_iterations length:4 atIndex:10];
+
+        MTLSize tg_size = MTLSizeMake(1024, 1, 1);
+        MTLSize grid = MTLSizeMake(B, 1, 1);
+        [e dispatchThreadgroups:grid threadsPerThreadgroup:tg_size];
+        [e endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        memcpy(quantized_out, buf_q.contents, q_size);
+        memcpy(sf_out, buf_sf.contents, sf_size);
+        memcpy(gg_out, buf_gg.contents, B * sizeof(int32_t));
+        memcpy(bits_out, buf_bits.contents, B * sizeof(int32_t));
+        return 0;
     }
 }
 

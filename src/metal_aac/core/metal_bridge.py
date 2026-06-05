@@ -242,6 +242,64 @@ class MetalHuffman:
 
         return quantized_out, sf_out, gg_out
 
+    def quantize_iso(
+        self,
+        mdct_coeffs: np.ndarray,
+        target_bits: int,
+        sample_rate: int = 44100,
+        max_iterations: int = 8,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """ISO quantization on Metal GPU with clipping-aware per-band SF."""
+        from metal_aac.tables.scalefactor_bands import get_sfb_offsets
+        from metal_aac.core.quantization import _build_sfb_map
+
+        B, N = mdct_coeffs.shape
+        sfb_offsets = get_sfb_offsets(sample_rate)
+        num_sfb = len(sfb_offsets) - 1
+        sfb_map = _build_sfb_map(sfb_offsets, N)
+
+        if not hasattr(self._lib, '_iso_quant_setup'):
+            _c_float_p = ctypes.POINTER(ctypes.c_float)
+            self._lib.metal_quantize_iso.restype = ctypes.c_int
+            self._lib.metal_quantize_iso.argtypes = [
+                ctypes.c_void_p,
+                _c_float_p, _c_int32_p, _c_int32_p,
+                ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+                ctypes.c_int32, ctypes.c_int32,
+                _c_int32_p, _c_int32_p, _c_int32_p, _c_int32_p,
+            ]
+            self._lib._iso_quant_setup = True
+
+        coeffs = np.ascontiguousarray(mdct_coeffs, dtype=np.float32)
+        sfb_arr = np.array(sfb_offsets, dtype=np.int32)
+        map_arr = np.ascontiguousarray(sfb_map, dtype=np.int32)
+        q_out = np.zeros(B * N, dtype=np.int32)
+        sf_out = np.zeros(B * num_sfb, dtype=np.int32)
+        gg_out = np.zeros(B, dtype=np.int32)
+        bits_out = np.zeros(B, dtype=np.int32)
+
+        _c_float_p = ctypes.POINTER(ctypes.c_float)
+        rc = self._lib.metal_quantize_iso(
+            self._ctx,
+            coeffs.ctypes.data_as(_c_float_p),
+            sfb_arr.ctypes.data_as(_c_int32_p),
+            map_arr.ctypes.data_as(_c_int32_p),
+            B, N, num_sfb, target_bits, max_iterations,
+            q_out.ctypes.data_as(_c_int32_p),
+            sf_out.ctypes.data_as(_c_int32_p),
+            gg_out.ctypes.data_as(_c_int32_p),
+            bits_out.ctypes.data_as(_c_int32_p),
+        )
+        if rc != 0:
+            raise RuntimeError(f"Metal ISO quantize failed (rc={rc})")
+
+        return (
+            q_out.reshape(B, N),
+            sf_out.reshape(B, num_sfb),
+            gg_out,
+            bits_out,
+        )
+
     def quantize(
         self,
         mdct_coeffs: np.ndarray,

@@ -411,13 +411,21 @@ def _encode_gpu(pcm: np.ndarray, config: EncoderConfig) -> EncoderResult:
     if config.output_format == "adts":
         with Timer() as t:
             target = config.target_bits_per_frame
-            quant_result = quantize_batch_gpu(
-                mdct_mx, masking_mx, target, config.sample_rate,
-            )
+            try:
+                from metal_aac.core.metal_bridge import MetalHuffman
+                metal_q = MetalHuffman.shared()
+                mdct_np = np.array(mdct_mx)
+                q, sf, gg, _ = metal_q.quantize_iso(
+                    mdct_np, target, config.sample_rate,
+                )
+            except (OSError, RuntimeError, FileNotFoundError):
+                quant_result = quantize_batch_gpu(
+                    mdct_mx, masking_mx, target, config.sample_rate,
+                )
+                q = quant_result.quantized
+                sf = quant_result.scalefactors
+                gg = quant_result.global_gain
         timings["quantization"] = t.elapsed
-        q = quant_result.quantized
-        sf = quant_result.scalefactors
-        gg = quant_result.global_gain
     else:
         # Legacy quantizer for internal round-trip
         try:
