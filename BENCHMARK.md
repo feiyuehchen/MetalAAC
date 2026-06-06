@@ -163,6 +163,29 @@ Note: previous reports listed Huffman decode as "~0ms" because the ADTS
 header parsing (21ms, Python) was measured separately. The actual C+GCD
 Huffman decode is 4ms; the 21ms Python ADTS parse is the decode bottleneck.
 
+## CPU Baseline vs Metal — Per-Stage Speedup (60s mono)
+
+### Encode
+
+| Stage | CPU Baseline | Metal v0.13.1 | Speedup |
+|-------|-------------|---------------|---------|
+| Framing | 3 ms | 2 ms | — |
+| MDCT | 21 ms | 17 ms | 1.2x |
+| Psychoacoustic | 51 ms | 3 ms | **17x** |
+| Quantization | 8050 ms | 8 ms | **1000x** |
+| Huffman + ADTS | 236 ms | 17 ms | **14x** |
+| **Total** | **8362 ms** | **48 ms** | **174x** |
+
+### Decode
+
+| Stage | CPU Baseline | Metal v0.13.1 | Speedup |
+|-------|-------------|---------------|---------|
+| ADTS + Huffman parse | 71 ms | 25 ms (21 Python + 4 C) | **3x** |
+| Dequantize | 26 ms | 7 ms | **4x** |
+| IMDCT | 23 ms | 24 ms | — |
+| Overlap-add | 4 ms | 5 ms | — |
+| **Total** | **125 ms** | **56 ms** | **2x** |
+
 ## Encode Optimization History
 
 | Version | 60s encode | vs Apple | Key change |
