@@ -140,23 +140,28 @@ def measure_peak_memory(func: Callable, *args) -> tuple[float, Any]
 
 | Stage | Time (ms) | Accelerator |
 |-------|-----------|-------------|
-| Framing | 3 | MLX GPU |
-| Transient detect | 4 | MLX GPU |
-| MDCT | 27 | MLX GPU (matmul) |
+| Framing | 2 | MLX GPU |
+| Transient detect | 2 | MLX GPU |
+| MDCT | 17 | MLX GPU (matmul) |
 | Psychoacoustic | 3 | MLX GPU (FFT) |
-| Quantization | 9 | Metal GPU (binary search) |
-| Huffman + ADTS | 15 | Metal GPU |
-| **Total** | **61** | |
+| Quantization | 8 | Metal GPU (binary search) |
+| Huffman + ADTS | 17 | Metal GPU |
+| **Total** | **48** | |
 
 ## Decoder Stage Breakdown (60s mono ADTS)
 
 | Stage | Time (ms) | Accelerator |
 |-------|-----------|-------------|
-| Huffman parse + overhead | 24 | Native C + GCD |
-| Dequantize | 9 | MLX GPU |
-| IMDCT | 19 | MLX GPU (matmul) |
-| Overlap-add | 7 | NumPy |
-| **Total** | **56** (GPU) | |
+| ADTS header parse | 21 | Python (sync word scan) |
+| Huffman decode | 4 | Native C + GCD (LUT) |
+| Dequantize | 7 | MLX GPU |
+| IMDCT | 24 | MLX GPU (matmul) |
+| Overlap-add | 5 | NumPy |
+| **Total** | **56** | |
+
+Note: previous reports listed Huffman decode as "~0ms" because the ADTS
+header parsing (21ms, Python) was measured separately. The actual C+GCD
+Huffman decode is 4ms; the 21ms Python ADTS parse is the decode bottleneck.
 
 ## Encode Optimization History
 

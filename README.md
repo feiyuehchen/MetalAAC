@@ -163,30 +163,36 @@ one consistent path — no mixed Metal/MLX within a single call.
 ```
 Metal path (primary, Apple Silicon + dylib):
   Encode: PCM → Frame(MLX) → MDCT(MLX) → Quantize(Metal) → Huffman(Metal) → ADTS
-  Decode: ADTS → Huffman(C+GCD) → Dequant(MLX) → IMDCT(MLX) → PCM
+                2ms            17ms         8ms               17ms
+
+  Decode: ADTS → Parse(Python) → Huffman(C+GCD) → Dequant(MLX) → IMDCT(MLX) → PCM
+                 21ms            4ms               7ms            24ms
 
 MLX fallback (no dylib built):
   Encode: PCM → Frame(MLX) → MDCT(MLX) → Quantize(MLX) → Huffman(Python) → ADTS
-  Decode: ADTS → Huffman(Python LUT) → Dequant(NumPy) → IMDCT(CPU) → PCM
+  Decode: ADTS → Parse+Huffman(Python LUT) → Dequant(NumPy) → IMDCT(CPU) → PCM
 ```
 
 ### Pipeline Stages (60s mono, Metal path)
 
 | Encode Stage | Time | Accelerator |
 |-------------|------|-------------|
-| Framing | 8 ms | MLX GPU |
-| Transient detect | 6 ms | MLX GPU |
-| MDCT | 33 ms | MLX GPU (matmul) |
-| Psychoacoustic | 6 ms | MLX GPU (FFT) |
-| Quantization | 21 ms | Metal GPU (binary search) |
-| Huffman + ADTS | 18 ms | Metal GPU |
+| Framing | 2 ms | MLX GPU |
+| Transient detect | 2 ms | MLX GPU |
+| MDCT | 17 ms | MLX GPU (matmul) |
+| Psychoacoustic | 3 ms | MLX GPU (FFT) |
+| Quantization | 8 ms | Metal GPU (binary search) |
+| Huffman + ADTS | 17 ms | Metal GPU |
+| **Total** | **48 ms** | |
 
 | Decode Stage | Time | Accelerator |
 |-------------|------|-------------|
-| Huffman parse | ~0 ms | Native C + GCD |
-| Dequantize | 9 ms | MLX GPU |
-| IMDCT | 19 ms | MLX GPU (matmul) |
-| Overlap-add | 7 ms | NumPy |
+| ADTS header parse | 21 ms | Python |
+| Huffman decode | 4 ms | Native C + GCD (LUT) |
+| Dequantize | 7 ms | MLX GPU |
+| IMDCT | 24 ms | MLX GPU (matmul) |
+| Overlap-add | 5 ms | NumPy |
+| **Total** | **56 ms** | |
 
 ## Project Structure
 
