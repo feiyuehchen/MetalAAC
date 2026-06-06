@@ -100,21 +100,27 @@ def measure_peak_memory(func: Callable, *args) -> tuple[float, Any]
 
 # Part B — Results (v0.12.0, M3 Pro, best of 5 runs)
 
-## Cross-Encoder Comparison (encode-only, 128 kbps mono)
+## Cross-Encoder/Decoder Comparison (128 kbps mono, M3 Pro)
 
-| Duration | MetalAAC | Apple afconvert | ffmpeg aac | vs Apple |
-|----------|----------|-----------------|------------|----------|
-| 10s | **36 ms** | 44 ms | 138 ms | 1.2x |
-| 60s | **46 ms** | 157 ms | 390 ms | **3.4x** |
-| 300s | **169 ms** | 707 ms | 1764 ms | **4.2x** |
+### Encode
 
-## Cross-Decoder Comparison (60s mono ADTS)
+| Duration | MetalAAC | Apple afconvert | ffmpeg aac | MetalAAC vs Apple |
+|----------|----------|-----------------|------------|-------------------|
+| 10s | **32 ms** | 43 ms | 136 ms | **1.4x faster** |
+| 60s | **46 ms** | 162 ms | 407 ms | **3.5x faster** |
+| 300s | **166 ms** | 701 ms | 1939 ms | **4.2x faster** |
 
-| Decoder | Time | vs ffmpeg |
-|---------|------|----------|
-| MetalAAC GPU | **56 ms** | **2.1x faster** |
-| MetalAAC CPU | 59 ms | 2.0x faster |
-| ffmpeg | 117 ms | baseline |
+### Decode
+
+| Duration | MetalAAC | Apple (ffmpeg dec) | ffmpeg | MetalAAC vs ffmpeg |
+|----------|----------|--------------------|--------|--------------------|
+| 10s | **19 ms** | 83 ms | 80 ms | **4.2x faster** |
+| 60s | **52 ms** | 116 ms | 113 ms | **2.2x faster** |
+| 300s | 1537 ms | 288 ms | 304 ms | 0.2x (Python ADTS parse bottleneck) |
+
+Note: MetalAAC decode scales poorly at 300s because `ADTSReader` (Python) scans
+the entire bitstream byte-by-byte. At 60s the C+GCD Huffman decode dominates;
+at 300s the Python parse dominates. Moving ADTS parse to C would fix this.
 
 ## Quality (ADTS, ffmpeg decode, 128 kbps target)
 
