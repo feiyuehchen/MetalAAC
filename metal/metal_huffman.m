@@ -851,6 +851,46 @@ int metal_quantize_iso(
     }
 }
 
+static const int _adts_sr_table[] = {
+    96000, 88200, 64000, 48000, 44100, 32000,
+    24000, 22050, 16000, 12000, 11025, 8000, 0, 0, 0, 0
+};
+
+int metal_parse_adts(
+    const uint8_t* data, int32_t data_len,
+    int32_t* payload_offsets_out, int32_t* payload_sizes_out,
+    int32_t* sample_rates_out, int32_t* channel_configs_out,
+    int32_t max_frames, int32_t* num_frames_out)
+{
+    int pos = 0;
+    int count = 0;
+    while (pos + 7 <= data_len && count < max_frames) {
+        if (data[pos] != 0xFF || (data[pos+1] & 0xF0) != 0xF0) {
+            pos++;
+            continue;
+        }
+        int protection_absent = data[pos+1] & 0x1;
+        int sf_index = (data[pos+2] >> 2) & 0xF;
+        int ch_config = ((data[pos+2] & 0x1) << 2) | ((data[pos+3] >> 6) & 0x3);
+        int frame_length = ((data[pos+3] & 0x3) << 11) | (data[pos+4] << 3) | ((data[pos+5] >> 5) & 0x7);
+        int header_size = protection_absent ? 7 : 9;
+
+        if (frame_length < header_size || pos + frame_length > data_len) {
+            pos++;
+            continue;
+        }
+
+        payload_offsets_out[count] = pos + header_size;
+        payload_sizes_out[count] = frame_length - header_size;
+        sample_rates_out[count] = (sf_index < 12) ? _adts_sr_table[sf_index] : 0;
+        channel_configs_out[count] = ch_config;
+        count++;
+        pos += frame_length;
+    }
+    *num_frames_out = count;
+    return 0;
+}
+
 int metal_decode_iso_frames(
     const uint8_t* payloads,
     const int32_t* payload_offsets,

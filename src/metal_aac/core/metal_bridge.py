@@ -15,6 +15,47 @@ _c_uint8_p = ctypes.POINTER(ctypes.c_uint8)
 _metal_available: bool | None = None
 
 
+def parse_adts_native(data: bytes) -> list[tuple[dict, bytes]]:
+    """Parse ADTS frames using native C. Returns [(header_dict, payload_bytes), ...]."""
+    lib = ctypes.CDLL(str(_LIB_PATH))
+    lib.metal_parse_adts.restype = ctypes.c_int
+    lib.metal_parse_adts.argtypes = [
+        ctypes.POINTER(ctypes.c_uint8), ctypes.c_int32,
+        _c_int32_p, _c_int32_p, _c_int32_p, _c_int32_p,
+        ctypes.c_int32, _c_int32_p,
+    ]
+
+    max_frames = len(data) // 7 + 1
+    offsets = np.zeros(max_frames, dtype=np.int32)
+    sizes = np.zeros(max_frames, dtype=np.int32)
+    srates = np.zeros(max_frames, dtype=np.int32)
+    chcfgs = np.zeros(max_frames, dtype=np.int32)
+    nframes = np.zeros(1, dtype=np.int32)
+
+    data_arr = np.frombuffer(data, dtype=np.uint8).copy()
+    lib.metal_parse_adts(
+        data_arr.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        len(data),
+        offsets.ctypes.data_as(_c_int32_p),
+        sizes.ctypes.data_as(_c_int32_p),
+        srates.ctypes.data_as(_c_int32_p),
+        chcfgs.ctypes.data_as(_c_int32_p),
+        max_frames,
+        nframes.ctypes.data_as(_c_int32_p),
+    )
+
+    n = int(nframes[0])
+    result = []
+    for i in range(n):
+        hdr = {
+            "sample_rate": int(srates[i]),
+            "channel_configuration": int(chcfgs[i]),
+        }
+        payload = data[int(offsets[i]):int(offsets[i]) + int(sizes[i])]
+        result.append((hdr, payload))
+    return result
+
+
 def has_metal() -> bool:
     """Check if Metal native library is available (cached)."""
     global _metal_available

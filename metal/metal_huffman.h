@@ -101,6 +101,17 @@ int metal_quantize_iso(
     int32_t* bits_out
 );
 
+int metal_parse_adts(
+    const uint8_t* data,
+    int32_t data_len,
+    int32_t* payload_offsets_out,
+    int32_t* payload_sizes_out,
+    int32_t* sample_rates_out,
+    int32_t* channel_configs_out,
+    int32_t max_frames,
+    int32_t* num_frames_out
+);
+
 int metal_huffman_quantize(
     MetalHuffmanCtx* ctx,
     const float* mdct_coeffs,

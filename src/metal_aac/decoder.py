@@ -82,8 +82,13 @@ def _parse_frames(bitstream: bytes) -> tuple[list[tuple], int, int, bool, int]:
     Returns: (frame_list, sample_rate, num_sfb, is_adts, num_channels)
     """
     if _is_adts(bitstream):
-        reader = ADTSReader(bitstream)
-        raw_frames = reader.read_all_frames()
+        from metal_aac.core.metal_bridge import has_metal
+        if has_metal():
+            from metal_aac.core.metal_bridge import parse_adts_native
+            raw_frames = parse_adts_native(bitstream)
+        else:
+            reader = ADTSReader(bitstream)
+            raw_frames = reader.read_all_frames()
         if not raw_frames:
             return [], 44100, 49, True, 1
         sr = raw_frames[0][0]["sample_rate"]
