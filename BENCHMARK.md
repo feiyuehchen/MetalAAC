@@ -100,27 +100,38 @@ def measure_peak_memory(func: Callable, *args) -> tuple[float, Any]
 
 # Part B — Results (v0.12.0, M3 Pro, best of 5 runs)
 
-## Cross-Encoder/Decoder Comparison (128 kbps mono, M3 Pro)
+## Cross-Encoder/Decoder Comparison (128 kbps mono, M3 Pro, best of 5)
 
 ### Encode
 
-| Duration | MetalAAC | Apple afconvert | ffmpeg aac | MetalAAC vs Apple |
-|----------|----------|-----------------|------------|-------------------|
-| 10s | **32 ms** | 43 ms | 136 ms | **1.4x faster** |
-| 60s | **46 ms** | 162 ms | 407 ms | **3.5x faster** |
-| 300s | **166 ms** | 701 ms | 1939 ms | **4.2x faster** |
+| Encoder | 10s | 60s | 300s | Technology |
+|---------|-----|-----|------|------------|
+| **MetalAAC** | **28 ms** | **48 ms** | **167 ms** | Metal GPU compute shaders |
+| Apple afconvert | 45 ms | 162 ms | 699 ms | AudioToolbox (Apple native CPU) |
+| ffmpeg aac_at | 135 ms | 315 ms | 1161 ms | AudioToolbox via ffmpeg |
+| ffmpeg aac | 136 ms | 390 ms | 1755 ms | ffmpeg native (CPU software) |
+
+MetalAAC vs Apple afconvert: **1.6x** (10s), **3.3x** (60s), **4.2x** (300s) faster.
+MetalAAC vs ffmpeg aac_at (AudioToolbox): **4.8x** (10s), **6.5x** (60s), **7.0x** (300s) faster.
+
+Note: AudioToolbox is NOT hardware-accelerated — AAC has no dedicated hardware
+decoder on Mac (unlike H.264/HEVC which use VideoToolbox silicon). AudioToolbox
+is Apple's highly optimized C/NEON SIMD software implementation running on CPU.
+MetalAAC uses GPU parallel binary search (1024 threads per frame) to outperform it.
 
 ### Decode
 
-| Duration | MetalAAC | Apple (ffmpeg dec) | ffmpeg | MetalAAC vs ffmpeg |
-|----------|----------|--------------------|--------|--------------------|
-| 10s | **19 ms** | 83 ms | 80 ms | **4.2x faster** |
-| 60s | **52 ms** | 116 ms | 113 ms | **2.2x faster** |
-| 300s | 1537 ms | 288 ms | 304 ms | 0.2x (Python ADTS parse bottleneck) |
+| Decoder | 10s | 60s | 300s | Technology |
+|---------|-----|-----|------|------------|
+| **MetalAAC** | **22 ms** | **42 ms** | **131 ms** | Native C (GCD parallel) + MLX GPU |
+| ffmpeg aac | 82 ms | 120 ms | 277 ms | ffmpeg native (CPU software) |
+| ffmpeg aac_at | 97 ms | 137 ms | 321 ms | AudioToolbox via ffmpeg |
 
-Note: MetalAAC decode scales poorly at 300s because `ADTSReader` (Python) scans
-the entire bitstream byte-by-byte. At 60s the C+GCD Huffman decode dominates;
-at 300s the Python parse dominates. Moving ADTS parse to C would fix this.
+MetalAAC vs ffmpeg aac: **3.7x** (10s), **2.8x** (60s), **2.1x** (300s) faster.
+MetalAAC vs ffmpeg aac_at (AudioToolbox): **4.4x** (10s), **3.2x** (60s), **2.5x** (300s) faster.
+
+Note: ffmpeg aac_at (AudioToolbox) is slower than ffmpeg native for decoding,
+likely due to ffmpeg↔AudioToolbox bridging overhead.
 
 ## Quality (ADTS, ffmpeg decode, 128 kbps target)
 
